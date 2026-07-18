@@ -8,7 +8,6 @@ import {
 	Empty,
 	Input,
 	Loader,
-	Select,
 	Text,
 	useKumoToastManager,
 } from "@cloudflare/kumo";
@@ -62,6 +61,20 @@ export default function HomeRoute() {
 			setSelectedDomain(domains[0]);
 		}
 	}, [domains, selectedDomain]);
+
+	// Domain suggestions: server-side substring search over the (possibly
+	// thousands-strong) discovered zone list, debounced. The field itself is
+	// free text — any domain or subdomain is accepted; suggestions are hints.
+	const [domainSuggestions, setDomainSuggestions] = useState<string[]>([]);
+	useEffect(() => {
+		const t = setTimeout(() => {
+			api
+				.searchDomains(selectedDomain)
+				.then((r) => setDomainSuggestions(r.domains))
+				.catch(() => setDomainSuggestions(domains));
+		}, 200);
+		return () => clearTimeout(t);
+	}, [selectedDomain, domains]);
 
 	// Auto-create mailboxes from config (run once when both data sources are ready)
 	const autoCreateDone = useRef(false);
@@ -268,27 +281,22 @@ export default function HomeRoute() {
 									/>
 								</div>
 								<span className="text-sm text-kumo-subtle">@</span>
-								{domains.length > 1 ? (
-									<div className="flex-1">
-							<Select
-								aria-label="Domain"
-								value={selectedDomain}
-								onValueChange={(value) => {
-									if (value) setSelectedDomain(value);
-								}}
-							>
-											{domains.map((d) => (
-												<Select.Option key={d} value={d}>
-													{d}
-												</Select.Option>
-											))}
-										</Select>
-									</div>
-								) : (
-									<span className="text-sm text-kumo-subtle">
-										{selectedDomain || "no domain"}
-									</span>
-								)}
+								<div className="flex-1">
+									<Input
+										aria-label="Domain"
+										placeholder="example.com"
+										size="sm"
+										value={selectedDomain}
+										onChange={(e) => setSelectedDomain(e.target.value)}
+										list="domain-suggestions"
+										required
+									/>
+									<datalist id="domain-suggestions">
+										{domainSuggestions.map((d) => (
+											<option key={d} value={d} />
+										))}
+									</datalist>
+								</div>
 							</div>
 						</div>
 						<Input

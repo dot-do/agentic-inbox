@@ -16,6 +16,7 @@ import {
 	listMailboxes,
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
+import { listDomains, searchDomains } from "./lib/domains";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
@@ -85,11 +86,18 @@ app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
 // -- Config ---------------------------------------------------------
 
-app.get("/api/v1/config", (c) => {
-	const domainsRaw = c.env.DOMAINS || "";
-	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
+app.get("/api/v1/config", async (c) => {
+	const { domains, dynamic } = await listDomains(c.env);
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
-	return c.json({ domains, emailAddresses });
+	return c.json({ domains, emailAddresses, dynamicDomains: dynamic });
+});
+
+// Searchable domain suggestions for the create-mailbox combobox. Suggestions
+// only — mailbox addresses are free text; see workers/lib/domains.ts.
+app.get("/api/v1/domains", async (c) => {
+	const { domains, dynamic } = await listDomains(c.env);
+	const q = c.req.query("q") ?? "";
+	return c.json({ domains: searchDomains(domains, q), dynamic });
 });
 
 // -- Mailboxes ------------------------------------------------------
