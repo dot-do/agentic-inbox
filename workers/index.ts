@@ -15,6 +15,7 @@ import {
 	buildThreadingHeaders,
 	listMailboxes,
 } from "./lib/email-helpers";
+import { getAgentByName } from "agents";
 import { SendEmailRequestSchema } from "./lib/schemas";
 import { listDomains, searchDomains } from "./lib/domains";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
@@ -410,11 +411,18 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
 
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
-	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
-	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	// Agents SDK DOs must be addressed via getAgentByName (it sets the
+	// namespace/room headers) — a raw idFromName stub 500s inside the SDK.
+	ctx.waitUntil(
+		getAgentByName(env.EMAIL_AGENT, mailboxId)
+			.then((agentStub) =>
+				agentStub.fetch(new Request("https://agents/onNewEmail", {
+					method: "POST", headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+				})),
+			)
+			.catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)),
+	);
 }
 
 export { app, receiveEmail };
