@@ -1,7 +1,14 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "agentic-inbox",
+	"account_id": "b6641681fe423910342b9ffa1364c76d",
 	"compatibility_date": "2025-11-28",
+	"routes": [
+		{
+			"pattern": "emails.do",
+			"custom_domain": true
+		}
+	],
 	"main": "./workers/app.ts",
 	"observability": {
 		"enabled": true
@@ -13,7 +20,7 @@
 		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
+		"DOMAINS": "emails.do",
 		"EMAIL_ADDRESSES": []
 	},
 	"send_email": [
