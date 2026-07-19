@@ -7,6 +7,14 @@
 		{
 			"pattern": "emails.do",
 			"custom_domain": true
+		},
+		{
+			// Interim UI door: this hostname is covered by the pre-existing
+			// "workflows.do" Access app (aud in POLICY_AUD), letting the UI open
+			// without Access:Edit API permission. Swap for an emails.do Access
+			// app + aud when one exists, then drop this route.
+			"pattern": "api.workflows.do",
+			"custom_domain": true
 		}
 	],
 	"main": "./workers/app.ts",
