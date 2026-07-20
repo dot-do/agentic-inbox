@@ -4,9 +4,15 @@
 
 import { routeAgentRequest } from "agents";
 import { Hono } from "hono";
-import { jwtVerify, createRemoteJWKSet } from "jose";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
+import {
+	authenticate,
+	handleAuthCallback,
+	handleLogin,
+	handleLogout,
+	isPublicAuthPath,
+} from "./lib/auth";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
 
@@ -28,57 +34,50 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
-function getAccessUrls(teamDomain: string) {
-	const certsPath = "/cdn-cgi/access/certs";
-	const teamUrl = new URL(teamDomain);
-	const issuer = teamUrl.origin;
-	const certsUrl = teamUrl.pathname.endsWith(certsPath)
-		? teamUrl
-		: new URL(certsPath, issuer);
-
-	return { issuer, certsUrl };
-}
-
 // Main app that wraps the API and adds React Router fallback
 const app = new Hono<{ Bindings: Env }>();
 
-// Cloudflare Access JWT validation middleware (production only)
+// Authentication middleware (production only). The actual verification lives
+// in ./lib/auth and dispatches on env.AUTH_MODE: "cf-access" (default, the
+// pre-existing Cloudflare Access JWT check) or "id.org.ai" (OIDC sessions for
+// browsers, bearer-token verification for API/MCP/agents).
+//
+// Authorization model note: any authenticated principal can access all
+// mailboxes in this app by design (single trust boundary).
 app.use("*", async (c, next) => {
 	// Skip validation in development
 	if (import.meta.env.DEV) {
 		return next();
 	}
 
-	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
-
-	// Fail closed in production if Access is not configured.
-	if (!POLICY_AUD || !TEAM_DOMAIN) {
-		return c.text(
-			"Cloudflare Access must be configured in production. Set POLICY_AUD and TEAM_DOMAIN.",
-			500,
-		);
+	// The login-bootstrap routes (/auth/login, /auth/callback, /auth/logout)
+	// must stay reachable for unauthenticated users, or nobody could ever
+	// sign in. Everything else — including /mcp and the SPA — stays gated.
+	if (isPublicAuthPath(c.req.path)) {
+		return next();
 	}
 
-	const token = c.req.header("cf-access-jwt-assertion");
-	if (!token) {
-		return c.text("Missing required CF Access JWT", 403);
+	// The relay ingest endpoint (POST /api/v1/ingest) is server-to-server: it
+	// carries no browser session and no id.org.ai bearer. It is exempt from
+	// this middleware and instead authenticated by the RELAY_SECRET HMAC that
+	// its own handler verifies over the raw body (workers/lib/relay-hmac.ts).
+	if (c.req.path === "/api/v1/ingest") {
+		return next();
 	}
 
-	try {
-		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
-		const JWKS = createRemoteJWKSet(certsUrl);
-		await jwtVerify(token, JWKS, {
-			issuer,
-			audience: POLICY_AUD,
-		});
-	} catch {
-		return c.text("Invalid or expired Access token", 403);
+	const r = await authenticate(c, c.env);
+	if (!r.ok) {
+		return r.response;
 	}
-
-	// Authorization model note: once a teammate passes the shared Cloudflare
-	// Access policy, they can access all mailboxes in this app by design.
 	return next();
 });
+
+// Auth bootstrap routes (exempted from the middleware above). In cf-access
+// mode these are inert: the handlers 404, and Cloudflare Access itself still
+// fronts every request including these paths.
+app.get("/auth/login", (c) => handleLogin(c, c.env));
+app.get("/auth/callback", (c) => handleAuthCallback(c, c.env));
+app.get("/auth/logout", (c) => handleLogout(c, c.env));
 
 // MCP server endpoint — used by AI coding tools (ProtoAgent, Claude Code, Cursor, etc.)
 // Must be before API routes and React Router catch-all
