@@ -57,6 +57,14 @@ app.use("*", async (c, next) => {
 		return next();
 	}
 
+	// The relay ingest endpoint (POST /api/v1/ingest) is server-to-server: it
+	// carries no browser session and no id.org.ai bearer. It is exempt from
+	// this middleware and instead authenticated by the RELAY_SECRET HMAC that
+	// its own handler verifies over the raw body (workers/lib/relay-hmac.ts).
+	if (c.req.path === "/api/v1/ingest") {
+		return next();
+	}
+
 	const r = await authenticate(c, c.env);
 	if (!r.ok) {
 		return r.response;

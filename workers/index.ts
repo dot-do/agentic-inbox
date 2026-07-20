@@ -6,8 +6,9 @@ import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
 import { z } from "zod";
-import { sendEmail } from "./email-sender";
+import { sendVia } from "./email-sender";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
+import { verifyRelayRequest, RELAY_SIG_HEADER, RELAY_TS_HEADER } from "./lib/relay-hmac";
 import {
 	validateSender,
 	SenderValidationError,
@@ -211,7 +212,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	}, attachmentData);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendVia(c.env, {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
@@ -334,6 +335,46 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 	return new Response(obj.body, { headers });
 });
 
+// -- Relay ingest (inbound cascade) ---------------------------------
+
+// POST /api/v1/ingest — a per-account relay worker (e.g. relay.longtail.studio
+// in the Semantics.dev account) forwards normalized inbound mail here for
+// domains the center cannot catch locally. This endpoint is EXEMPT from the
+// browser/session auth middleware (see the bypass in workers/app.ts) and is
+// instead authenticated by the shared RELAY_SECRET HMAC, verified below over
+// the raw body + timestamp header. On success it stores into the correct
+// MailboxDO INBOX exactly as receiveEmail does and fires the auto-draft trigger.
+app.post("/api/v1/ingest", async (c) => {
+	const rawBody = await c.req.text();
+
+	const verified = await verifyRelayRequest(
+		c.env.RELAY_SECRET ?? "",
+		rawBody,
+		c.req.header(RELAY_SIG_HEADER),
+		c.req.header(RELAY_TS_HEADER),
+	);
+	if (!verified.ok) {
+		console.warn(`/api/v1/ingest rejected: ${verified.reason}`);
+		return c.json({ error: "unauthorized", reason: verified.reason }, 401);
+	}
+
+	let msg: NormalizedInbound;
+	try {
+		msg = JSON.parse(rawBody) as NormalizedInbound;
+	} catch {
+		return c.json({ error: "bad_request", reason: "body is not valid JSON" }, 400);
+	}
+	if (!Array.isArray(msg.to) || typeof msg.from !== "string") {
+		return c.json({ error: "bad_request", reason: "to[] and from are required" }, 400);
+	}
+
+	// storeInboundEmail returns "ignored" (no matching/existing mailbox) or
+	// "stored" — a clean 200 either way, never a 500 (which would make CF Email
+	// Routing retry on the relay side for an unknown recipient).
+	const result = await storeInboundEmail(msg, c.env, c.executionCtx as ExecutionContext);
+	return c.json({ status: result });
+});
+
 // -- Receive inbound email ------------------------------------------
 
 const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
@@ -354,61 +395,88 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
-	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
-	const parsedEmail = await new PostalMime().parse(rawEmail);
+/**
+ * Normalized inbound message — the shared shape for storeInboundEmail(). It is
+ * produced two ways that both land in the exact same MailboxDO write:
+ *   1. receiveEmail() parses raw MIME (Cloudflare Email Routing on the .do zone)
+ *   2. the relay's POST /api/v1/ingest body (a remote account's inbound mail)
+ * Header-ish fields (messageId/inReplyTo/references) are RAW as parsed by
+ * PostalMime; storeInboundEmail does the `<...>` extraction so both callers
+ * stay identical.
+ */
+interface NormalizedInbound {
+	to: string[];
+	from: string;
+	subject: string;
+	html?: string;
+	text?: string;
+	messageId?: string | null; // raw, may contain angle brackets
+	inReplyTo?: string | null; // raw
+	references?: string | null; // raw, space-separated
+	cc?: string[];
+	bcc?: string[];
+	rawHeaders?: unknown; // stringified verbatim into raw_headers
+}
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
-
+/**
+ * Canonical store-to-INBOX + auto-draft path, factored out of receiveEmail so
+ * relayed mail (POST /api/v1/ingest) stores byte-for-byte identically. Resolves
+ * the mailbox by recipient (same allowedAddresses / mailbox-exists logic),
+ * writes to the MailboxDO INBOX with the same schema, and fires the same
+ * onNewEmail auto-draft trigger. Returns "ignored" (no matching/existing
+ * mailbox) or "stored" — never throws for the ignore cases so callers can
+ * return a clean response instead of a 500/retry.
+ */
+async function storeInboundEmail(
+	msg: NormalizedInbound,
+	env: Env,
+	ctx: ExecutionContext,
+	// Optional attachment materializer. Invoked only AFTER the mailbox-exists
+	// check, with the freshly generated email id so R2 keys and the DB row's
+	// email_id stay in lockstep. The local MIME path supplies this; the relay
+	// ingest path has no attachment blobs and omits it.
+	storeAttachmentsFor?: (messageId: string) => Promise<StoredAttachment[]>,
+): Promise<"ignored" | "stored"> {
 	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
-	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
-	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	const allRecipients = msg.to.map((a) => a?.toLowerCase()).filter(Boolean) as string[];
+	const ccRecipients = (msg.cc || []).map((a) => a?.toLowerCase()).filter(Boolean) as string[];
+	const bccRecipients = (msg.bcc || []).map((a) => a?.toLowerCase()).filter(Boolean) as string[];
 
 	let mailboxId: string | undefined;
 	if (allowedAddresses.length > 0) {
 		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
+		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return "ignored"; }
 	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	if (!mailboxId) { console.log("Ignoring email: no valid recipient address"); return "ignored"; }
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return "ignored"; }
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
-		}
-	}
+	const attachmentData: StoredAttachment[] = storeAttachmentsFor ? await storeAttachmentsFor(messageId) : [];
 
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
-	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
-	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
+	const inReplyTo = msg.inReplyTo ? extractMsgId(msg.inReplyTo) : null;
+	const emailReferences = msg.references ? msg.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
 	let threadId = emailReferences[0] || inReplyTo || messageId;
 
 	if (!inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
+		const subjectThread = await (stub as any).findThreadBySubject(msg.subject || "", msg.from || undefined);
 		if (subjectThread) threadId = subjectThread;
 	}
 
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
+	const originalMessageId = msg.messageId ? extractMsgId(msg.messageId) : null;
+	const sender = (msg.from || "").toLowerCase();
 
 	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
+		id: messageId, subject: msg.subject || "",
+		sender, recipient: allRecipients.join(", "),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
 		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
+		body: msg.html || msg.text || "",
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
+		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(msg.rawHeaders ?? []),
 	}, attachmentData);
 
 	// Agents SDK DOs must be addressed via getAgentByName (it sets the
@@ -418,11 +486,56 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 			.then((agentStub) =>
 				agentStub.fetch(new Request("https://agents/onNewEmail", {
 					method: "POST", headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+					body: JSON.stringify({ mailboxId, emailId: messageId, sender, subject: msg.subject || "", threadId }),
 				})),
 			)
 			.catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)),
 	);
+	return "stored";
 }
 
-export { app, receiveEmail };
+async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
+	const parsedEmail = await new PostalMime().parse(rawEmail);
+
+	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
+
+	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+
+	// Attachments are stored inside storeInboundEmail (after the mailbox-exists
+	// check) so their R2 keys and email_id match the generated email id, exactly
+	// as the pre-refactor path did.
+	const storeAttachmentsFor = async (messageId: string): Promise<StoredAttachment[]> => {
+		const attachmentData: StoredAttachment[] = [];
+		if (parsedEmail.attachments) {
+			for (const att of parsedEmail.attachments) {
+				const attId = crypto.randomUUID();
+				const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+				await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
+				attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
+					size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+					content_id: att.contentId || null, disposition: att.disposition || "attachment" });
+			}
+		}
+		return attachmentData;
+	};
+
+	await storeInboundEmail({
+		to: allRecipients,
+		from: parsedEmail.from?.address || "",
+		subject: parsedEmail.subject || "",
+		html: parsedEmail.html || undefined,
+		text: parsedEmail.text || undefined,
+		messageId: parsedEmail.messageId || null,
+		inReplyTo: parsedEmail.inReplyTo || null,
+		references: parsedEmail.references || null,
+		cc: ccRecipients,
+		bcc: bccRecipients,
+		rawHeaders: parsedEmail.headers,
+	}, env, ctx, storeAttachmentsFor);
+}
+
+export { app, receiveEmail, storeInboundEmail };
+export type { NormalizedInbound };

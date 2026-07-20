@@ -33,7 +33,12 @@
 		// Auth mode: "cf-access" (default) or "id.org.ai" (OIDC via id.org.ai).
 		// id.org.ai mode also requires secrets ID_ORG_AI_CLIENT_ID and SESSION_SECRET.
 		"AUTH_MODE": "id.org.ai",
-		"ID_ORG_AI_ISSUER": "https://id.org.ai"
+		"ID_ORG_AI_ISSUER": "https://id.org.ai",
+		// Email cascade registry: send-as domain -> per-account relay base URL.
+		// Seeded from ~/projects/domains/data/email-zones.tsv. Domains absent
+		// here are LOCAL (.do account) and sent directly via env.EMAIL.
+		// RELAY_SECRET is a wrangler SECRET, never a var.
+		"EMAIL_RELAYS": "{\"longtail.studio\":\"https://relay.longtail.studio\"}"
 	},
 	"send_email": [
 		{

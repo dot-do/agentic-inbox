@@ -24,4 +24,15 @@ export interface Env extends Cloudflare.Env {
 	// HMAC key for signing the session/state cookies (HS256). Required in
 	// id.org.ai mode; missing => fail closed with 500.
 	SESSION_SECRET?: string; // secret
+
+	// --- Email cascade: center <-> per-account relay (workers/lib/relay-hmac.ts) ---
+	// Shared HMAC secret with the per-account relay workers. Same 32-byte value
+	// set as `wrangler secret put RELAY_SECRET` in BOTH this worker and each
+	// relay. Verifies inbound POST /api/v1/ingest and signs outbound /send.
+	// (A secret, so it is not in the generated Cloudflare.Env; declared here.)
+	//
+	// EMAIL_RELAYS (registry-seeded JSON map of send-as domain -> relay base
+	// URL) is a wrangler var, so it arrives via Cloudflare.Env — see
+	// wrangler.jsonc and email-sender.ts parseEmailRelays().
+	RELAY_SECRET?: string; // secret
 }
