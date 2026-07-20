@@ -29,7 +29,11 @@
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
 		"DOMAINS": "emails.do",
-		"EMAIL_ADDRESSES": []
+		"EMAIL_ADDRESSES": [],
+		// Auth mode: "cf-access" (default) or "id.org.ai" (OIDC via id.org.ai).
+		// id.org.ai mode also requires secrets ID_ORG_AI_CLIENT_ID and SESSION_SECRET.
+		"AUTH_MODE": "id.org.ai",
+		"ID_ORG_AI_ISSUER": "https://id.org.ai"
 	},
 	"send_email": [
 		{

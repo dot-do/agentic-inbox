@@ -10,4 +10,18 @@ export interface Env extends Cloudflare.Env {
 	// to the static DOMAINS env var, and the UI becomes a searchable combobox.
 	CF_API_TOKEN?: string; // needs Zone:Read
 	CF_ACCOUNT_ID?: string; // optional: restrict zone listing to one account
+
+	// --- Pluggable auth (workers/lib/auth.ts) ---
+	// Selects the auth implementation. Absent/unknown => "cf-access"
+	// (the pre-existing Cloudflare Access behavior, unchanged).
+	AUTH_MODE?: "cf-access" | "id.org.ai";
+	// OIDC issuer origin; defaults to https://id.org.ai when unset.
+	ID_ORG_AI_ISSUER?: string;
+	// OAuth client registered with id.org.ai (var or secret).
+	ID_ORG_AI_CLIENT_ID?: string;
+	// Only for confidential clients; also enables opaque-token introspection.
+	ID_ORG_AI_CLIENT_SECRET?: string; // secret
+	// HMAC key for signing the session/state cookies (HS256). Required in
+	// id.org.ai mode; missing => fail closed with 500.
+	SESSION_SECRET?: string; // secret
 }
