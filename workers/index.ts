@@ -375,6 +375,36 @@ app.post("/api/v1/ingest", async (c) => {
 	return c.json({ status: result });
 });
 
+// POST /api/v1/_admin/read — HMAC-authed (RELAY_SECRET) operator read of recent
+// mail from a mailbox, or a listing of mailboxes when { list: true }. Bypasses
+// the browser/OIDC session (server-to-server only). Body: {mailbox, limit?} | {list:true}.
+app.post("/api/v1/_admin/read", async (c) => {
+	const rawBody = await c.req.text();
+	const verified = await verifyRelayRequest(
+		c.env.RELAY_SECRET ?? "",
+		rawBody,
+		c.req.header(RELAY_SIG_HEADER),
+		c.req.header(RELAY_TS_HEADER),
+	);
+	if (!verified.ok) return c.json({ error: "unauthorized", reason: verified.reason }, 401);
+
+	let req: { mailbox?: string; limit?: number; list?: boolean; emailId?: string };
+	try { req = JSON.parse(rawBody); } catch { return c.json({ error: "bad_request" }, 400); }
+
+	if (req.list) {
+		const boxes = await listMailboxes(c.env.BUCKET);
+		return c.json({ mailboxes: boxes.map((m) => m.id) });
+	}
+	if (!req.mailbox) return c.json({ error: "bad_request", reason: "mailbox required" }, 400);
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(req.mailbox.toLowerCase()));
+	if (req.emailId) {
+		const full = await stub.getEmail(req.emailId); // includes full body
+		return c.json({ mailbox: req.mailbox, email: full });
+	}
+	const emails = await stub.getEmails({ folder: Folders.INBOX, limit: req.limit ?? 20 });
+	return c.json({ mailbox: req.mailbox, count: emails.length, emails });
+});
+
 // -- Receive inbound email ------------------------------------------
 
 const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
@@ -450,7 +480,16 @@ async function storeInboundEmail(
 	if (!mailboxId) { console.log("Ignoring email: no valid recipient address"); return "ignored"; }
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return "ignored"; }
+	// Wildcard catch-all: when EMAIL_ADDRESSES imposes no allowlist, the inbox is
+	// a true catch-all for every routed domain — auto-provision a mailbox for any
+	// recipient rather than dropping the mail. (2FA/verification mail goes to
+	// per-service addresses that were never hand-created; dropping them is the bug.)
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		if (allowedAddresses.length > 0) { console.log(`Ignoring email for ${mailboxId}: not in EMAIL_ADDRESSES allowlist`); return "ignored"; }
+		const defaultSettings = { fromName: mailboxId, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
+		await env.BUCKET.put(`mailboxes/${mailboxId}.json`, JSON.stringify(defaultSettings));
+		console.log(`Auto-created mailbox ${mailboxId} (wildcard catch-all)`);
+	}
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
