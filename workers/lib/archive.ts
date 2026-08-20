@@ -168,8 +168,16 @@ interface LedgerMeta {
 	attachmentKeys?: string[];
 }
 
+/** Normalize a Message-ID to its bare form (no surrounding <...>). */
+function bareMessageId(id: string | null): string | null {
+	if (!id) return null;
+	const m = id.match(/<([^<>]+)>/);
+	return (m ? m[1] : id).trim() || null;
+}
+
 async function writeLedgerRecord(env: Env, address: string, meta: LedgerMeta): Promise<void> {
 	await ensureArchiveMailbox(env, address);
+	meta = { ...meta, originalMessageId: bareMessageId(meta.originalMessageId) };
 	const id = crypto.randomUUID();
 	const now = new Date().toISOString();
 	const truncated = meta.body.length > MAX_ARCHIVE_BODY_CHARS;
