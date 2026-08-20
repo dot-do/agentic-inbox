@@ -152,10 +152,13 @@ export interface SendViaOptions {
 }
 
 /**
- * Best-effort outbound journal into the agents@ archive mailbox
- * (EMAIL-CASCADE.md PROPOSAL v2 §(b)). Runs only AFTER a successful send.
- * FAILURE-ISOLATED: the returned promise never rejects — archive errors are
- * logged and swallowed so they can never fail or delay the actual send.
+ * Best-effort outbound ledger (EMAIL-CASCADE.md §(b), founder ruling
+ * 2026-08-20): a [ledger:outbound] journal email DELIVERED to the real
+ * archive mailbox (agents@do.industries, Google Workspace) from the
+ * dedicated ledger sender, plus a queryable index record in the ledger DO
+ * (ledger@emails.do). Runs only AFTER a successful send. FAILURE-ISOLATED:
+ * the returned promise never rejects — ledger errors are logged and
+ * swallowed so they can never fail or delay the actual send.
  */
 function journalOutbound(
 	env: Env,
@@ -192,10 +195,11 @@ function scheduleJournal(opts: SendViaOptions | undefined, journal: Promise<void
  * forward, compose, agent auto-send). Local domains keep the exact prior
  * behavior: a direct env.EMAIL.send() via sendEmail().
  *
- * After every successful send — local AND relayed — a forward-style journal
- * copy is filed into the archive mailbox (see journalOutbound above). The
- * journal is best-effort and can never fail OR delay the send: it is never
- * awaited on the send path (waitUntil with opts.ctx, detached without).
+ * After every successful send — local AND relayed — a [ledger:outbound]
+ * journal email is delivered to the archive mailbox and an index record is
+ * written to the ledger DO (see journalOutbound above). The journal is
+ * best-effort and can never fail OR delay the send: it is never awaited on
+ * the send path (waitUntil with opts.ctx, detached without).
  */
 export async function sendVia(
 	env: Env,

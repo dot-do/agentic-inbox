@@ -522,12 +522,14 @@ async function storeInboundEmail(
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(msg.rawHeaders ?? []),
 	}, attachmentData);
 
-	// agents@ archive: file an inbound ledger copy (X-Ledger-Copy: inbound)
-	// into the archive mailbox. Covers BOTH inbound paths — direct Email
-	// Routing (receiveEmail) and the relay /api/v1/ingest — since both flow
-	// through here. Best-effort via waitUntil + catch: an archive failure
-	// never fails or delays the real delivery. Attachment R2 keys are passed
-	// as references; bytes are not duplicated.
+	// Estate ledger (founder ruling 2026-08-20): deliver a [ledger:inbound]
+	// journal email to the real archive mailbox (agents@do.industries,
+	// Google Workspace) and index it in the ledger DO (ledger@emails.do).
+	// Covers BOTH inbound paths — direct Email Routing (receiveEmail) and
+	// the relay /api/v1/ingest — since both flow through here. Best-effort
+	// via waitUntil + catch: a ledger failure never fails or delays the real
+	// delivery. Attachment R2 keys are passed as references; bytes are not
+	// duplicated.
 	ctx.waitUntil(
 		archiveInboundCopy(
 			env, msg, mailboxId,

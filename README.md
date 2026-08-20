@@ -78,43 +78,59 @@ npm run deploy
 
 Any user who passes the shared Cloudflare Access policy can access all mailboxes in this app by design. This includes the MCP server at `/mcp` -- external AI tools (Claude Code, Cursor, etc.) connected via MCP can operate on any mailbox by passing a `mailboxId` parameter. There is no per-mailbox authorization; the Cloudflare Access policy is the single trust boundary.
 
-## The agents@ archive (email ledger)
+## The estate email ledger (agents@ archive)
 
-The center keeps a full ledger of everything it sends and receives in a
-dedicated **archive mailbox** (`workers/lib/archive.ts`), per the estate email
-design (`EMAIL-CASCADE.md`, PROPOSAL v2 §(b)):
+Founder ruling 2026-08-20: **the `agents@do.industries` archive is the real
+Google Workspace mailbox** — archive copies are DELIVERED there as actual
+emails. Every message through the center produces two ledger artifacts
+(`workers/lib/archive.ts`, per `EMAIL-CASCADE.md` §(b)):
 
-- **Outbound**: after every successful send — direct `env.EMAIL.send()` *and*
-  relayed `/send` (both pass through `sendVia`) — a forward-style journal copy
-  is filed into the archive mailbox, tagged `x-ledger-copy: outbound` with the
-  original Message-ID. It is a stored record, **not a re-send**: no quota
-  cost, no extra recipient, no loop vector.
-- **Inbound**: every stored inbound message (direct Email Routing and the
-  relay `/api/v1/ingest` path, both via `storeInboundEmail`) is copied to the
-  archive, tagged `x-ledger-copy: inbound` plus `x-delivered-to`.
-- **Attachments by reference**: archive records carry the original R2 keys in
-  an `x-archive-attachment-refs` raw-header entry; bytes are never duplicated.
-- **Loop guards**: messages already bearing `X-Ledger-Copy`, mail from/to the
-  archive address, and the archive mailbox's own traffic are never archived.
-- **Failure isolation**: archive writes are best-effort (`ctx.waitUntil` /
-  caught, detached promises). A failed — or arbitrarily slow — archive write
-  is logged and can never fail or delay the real send or delivery; the
-  journal is never awaited on the send path.
-- **Growth posture**: the ledger is unbounded by design (nothing prunes it).
-  Records are metadata + body text only — bodies are capped
-  (`MAX_ARCHIVE_BODY_CHARS`, truncated records tagged `x-archive-truncated`)
-  and attachment bytes are never duplicated — so a 10GB SQLite DO gives years
-  of headroom at estate volume. `ARCHIVE_ENABLED=false` is the pressure
-  valve; retention/rollover is deliberately deferred. Note attachment refs
-  are pointers: deleting the original email deletes the R2 blobs, and the
-  archive's refs then dangle (the ledger metadata survives).
+- **Journal delivery (the archive)**: after every successful outbound send
+  (direct `env.EMAIL.send()` *and* relayed `/send`, both via `sendVia`) and
+  every stored inbound message (Email Routing and relay `/api/v1/ingest`,
+  both via `storeInboundEmail`), the center sends a **real journal email** to
+  `ARCHIVE_ADDRESS` via CF Email Service → Google MX. Subject prefixed
+  `[ledger:outbound]` / `[ledger:inbound]`; headers `X-Ledger-Copy`,
+  `X-Original-Message-Id`, `X-Original-From`, `X-Original-To` (plus
+  `X-Delivered-To` inbound); body = original body. Sender is the dedicated
+  identity `LEDGER_ADDRESS` (`ledger@emails.do`) so the Google mailbox can
+  filter/label cleanly.
+- **Ledger DO index**: a queryable center-native MailboxDO record of the same
+  message, kept because it is free and agent-searchable. The index DO is
+  named `ledger@emails.do` (matching the sender) — **not**
+  `agents@do.industries` — eliminating the name collision with the real
+  Google mailbox. (The 6 pre-ruling records remain in the old
+  `agents@do.industries` DO, un-migrated by design.)
+- **Attachments by reference**: journal emails carry authenticated fetch
+  links + R2 keys, never re-attached bytes; index records carry the keys in
+  `x-archive-attachment-refs`. Refs are pointers — deleting the original
+  email deletes the blobs and the refs dangle.
+- **Loop guards (paramount)**: never journal a journal — messages bearing
+  `X-Ledger-Copy`, mail from the `ledger@` sender, and mail from/to the
+  archive or ledger addresses are never ledgered; the journal send also
+  bypasses `sendVia` structurally. `do.industries` inbound is Google (not
+  the center), so copies cannot re-enter — guarded anyway.
+- **Failure isolation**: ledger writes are best-effort (`ctx.waitUntil` /
+  caught, detached promises), and the two legs are isolated from each other
+  (`Promise.allSettled`). A failed — or arbitrarily slow — ledger write is
+  logged and can never fail or delay the real send or delivery.
+- **⚠️ Volume ceiling (founder decision deferred)**: journal delivery is one
+  real email per message into a single Workspace mailbox. At future migrated
+  volume (tens of thousands/day) this hits Workspace receiving limits — the
+  DO index is the scale path; the Google-delivery layer may then need
+  sampling/batching. See the header of `workers/lib/archive.ts`.
+- **Growth posture (DO index)**: unbounded by design; bodies capped
+  (`MAX_ARCHIVE_BODY_CHARS`, truncated records tagged `x-archive-truncated`),
+  attachment bytes never duplicated — a 10GB SQLite DO gives years of
+  headroom. `ARCHIVE_ENABLED=false` is the kill switch.
 
 Configuration (`wrangler.jsonc` vars):
 
 | var               | default                | meaning                                  |
 | ----------------- | ---------------------- | ---------------------------------------- |
-| `ARCHIVE_ADDRESS` | `agents@do.industries` | the archive mailbox (auto-created as a normal MailboxDO on first write) |
-| `ARCHIVE_ENABLED` | `true`                 | set `false` to disable all archive writes |
+| `ARCHIVE_ADDRESS` | `agents@do.industries` | the REAL archive mailbox (Google Workspace) journal emails are delivered to |
+| `LEDGER_ADDRESS`  | `ledger@emails.do`     | dedicated journal sender identity + name of the internal ledger index DO |
+| `ARCHIVE_ENABLED` | `true`                 | set `false` to disable all ledger activity |
 
 ## Tests
 

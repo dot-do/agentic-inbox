@@ -39,13 +39,19 @@
 		// here are LOCAL (.do account) and sent directly via env.EMAIL.
 		// RELAY_SECRET is a wrangler SECRET, never a var.
 		"EMAIL_RELAYS": "{\"longtail.studio\":\"https://relay.longtail.studio\"}",
-		// agents@ archive (EMAIL-CASCADE.md PROPOSAL v2 §(b)): center-native
-		// ledger mailbox that receives a stored forward-style copy of every
-		// outbound (X-Ledger-Copy: outbound) and inbound (X-Ledger-Copy:
-		// inbound) message. Copies are DO writes, never re-sends — no quota
-		// cost, no loop vector. Best-effort: an archive failure never blocks
-		// delivery. Set ARCHIVE_ENABLED to false to disable all archive writes.
+		// Estate email ledger (EMAIL-CASCADE.md §(b), founder ruling
+		// 2026-08-20): ARCHIVE_ADDRESS is the REAL Google Workspace archive
+		// mailbox — every outbound/inbound message produces a [ledger:*]
+		// journal email DELIVERED there (CF Email Service → Google MX) from
+		// the dedicated LEDGER_ADDRESS sender identity, plus a queryable
+		// index record in the LEDGER_ADDRESS MailboxDO. Loop-guarded
+		// (X-Ledger-Copy / ledger sender never journaled); best-effort — a
+		// ledger failure never blocks delivery. ARCHIVE_ENABLED=false is the
+		// kill switch. ⚠️ VOLUME: one Google-delivered email per message —
+		// at tens of thousands/day this hits Workspace receiving limits; the
+		// DO index is the scale path (see workers/lib/archive.ts header).
 		"ARCHIVE_ADDRESS": "agents@do.industries",
+		"LEDGER_ADDRESS": "ledger@emails.do",
 		"ARCHIVE_ENABLED": true
 	},
 	"send_email": [
