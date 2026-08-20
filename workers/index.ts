@@ -7,6 +7,7 @@ import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
 import { z } from "zod";
 import { sendVia } from "./email-sender";
+import { archiveInboundCopy } from "./lib/archive";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
 import { verifyRelayRequest, RELAY_SIG_HEADER, RELAY_TS_HEADER } from "./lib/relay-hmac";
 import {
@@ -216,6 +217,9 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
+		}, {
+			ctx: c.executionCtx,
+			attachmentKeys: attachmentData.map((a) => `attachments/${messageId}/${a.id}/${a.filename}`),
 		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
@@ -517,6 +521,24 @@ async function storeInboundEmail(
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(msg.rawHeaders ?? []),
 	}, attachmentData);
+
+	// agents@ archive: file an inbound ledger copy (X-Ledger-Copy: inbound)
+	// into the archive mailbox. Covers BOTH inbound paths — direct Email
+	// Routing (receiveEmail) and the relay /api/v1/ingest — since both flow
+	// through here. Best-effort via waitUntil + catch: an archive failure
+	// never fails or delays the real delivery. Attachment R2 keys are passed
+	// as references; bytes are not duplicated.
+	ctx.waitUntil(
+		archiveInboundCopy(
+			env, msg, mailboxId,
+			attachmentData.map((a) => `attachments/${messageId}/${a.id}/${a.filename}`),
+		)
+			.then((outcome) => {
+				// "skipped:disabled" is steady-state when the archive is off — not worth a log line per message.
+				if (outcome !== "archived" && outcome !== "skipped:disabled") console.log(`Inbound archive skipped (${outcome})`);
+			})
+			.catch((e) => console.error("Inbound archive write failed (delivery unaffected):", (e as Error).message)),
+	);
 
 	// Agents SDK DOs must be addressed via getAgentByName (it sets the
 	// namespace/room headers) — a raw idFromName stub 500s inside the SDK.

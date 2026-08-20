@@ -12,18 +12,19 @@ export interface Env extends Cloudflare.Env {
 	CF_ACCOUNT_ID?: string; // optional: restrict zone listing to one account
 
 	// --- Pluggable auth (workers/lib/auth.ts) ---
-	// Selects the auth implementation. Absent/unknown => "cf-access"
-	// (the pre-existing Cloudflare Access behavior, unchanged).
-	AUTH_MODE?: "cf-access" | "id.org.ai";
-	// OIDC issuer origin; defaults to https://id.org.ai when unset.
-	ID_ORG_AI_ISSUER?: string;
-	// OAuth client registered with id.org.ai (var or secret).
-	ID_ORG_AI_CLIENT_ID?: string;
+	// AUTH_MODE selects the auth implementation ("cf-access" | "id.org.ai");
+	// absent/unknown => "cf-access" (the pre-existing Cloudflare Access
+	// behavior, unchanged). It is a wrangler var, so it arrives via the
+	// generated Cloudflare.Env — not redeclared here because wrangler types
+	// renders vars as literal types and a wider redeclaration is a TS2430
+	// conflict (same convention as EMAIL_RELAYS and the archive vars below).
+	// ID_ORG_AI_ISSUER (OIDC issuer origin, defaults to https://id.org.ai),
+	// ID_ORG_AI_CLIENT_ID, and SESSION_SECRET (HS256 key for session/state
+	// cookies; required in id.org.ai mode, missing => fail closed with 500)
+	// likewise arrive via the generated Cloudflare.Env.
 	// Only for confidential clients; also enables opaque-token introspection.
+	// (Not in the generated Cloudflare.Env; declared here.)
 	ID_ORG_AI_CLIENT_SECRET?: string; // secret
-	// HMAC key for signing the session/state cookies (HS256). Required in
-	// id.org.ai mode; missing => fail closed with 500.
-	SESSION_SECRET?: string; // secret
 
 	// --- Email cascade: center <-> per-account relay (workers/lib/relay-hmac.ts) ---
 	// Shared HMAC secret with the per-account relay workers. Same 32-byte value
@@ -35,4 +36,10 @@ export interface Env extends Cloudflare.Env {
 	// URL) is a wrangler var, so it arrives via Cloudflare.Env — see
 	// wrangler.jsonc and email-sender.ts parseEmailRelays().
 	RELAY_SECRET?: string; // secret
+
+	// --- agents@ archive (workers/lib/archive.ts) ---
+	// ARCHIVE_ADDRESS ("agents@do.industries") and ARCHIVE_ENABLED (true) are
+	// wrangler vars, so they arrive via the generated Cloudflare.Env (wrangler
+	// types renders them as literal types; archive.ts reads them through
+	// tolerant accessors). Not redeclared here to avoid literal-type conflicts.
 }

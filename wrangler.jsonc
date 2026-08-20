@@ -38,7 +38,15 @@
 		// Seeded from ~/projects/domains/data/email-zones.tsv. Domains absent
 		// here are LOCAL (.do account) and sent directly via env.EMAIL.
 		// RELAY_SECRET is a wrangler SECRET, never a var.
-		"EMAIL_RELAYS": "{\"longtail.studio\":\"https://relay.longtail.studio\"}"
+		"EMAIL_RELAYS": "{\"longtail.studio\":\"https://relay.longtail.studio\"}",
+		// agents@ archive (EMAIL-CASCADE.md PROPOSAL v2 §(b)): center-native
+		// ledger mailbox that receives a stored forward-style copy of every
+		// outbound (X-Ledger-Copy: outbound) and inbound (X-Ledger-Copy:
+		// inbound) message. Copies are DO writes, never re-sends — no quota
+		// cost, no loop vector. Best-effort: an archive failure never blocks
+		// delivery. Set ARCHIVE_ENABLED to false to disable all archive writes.
+		"ARCHIVE_ADDRESS": "agents@do.industries",
+		"ARCHIVE_ENABLED": true
 	},
 	"send_email": [
 		{

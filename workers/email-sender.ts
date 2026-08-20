@@ -12,6 +12,7 @@
 
 import type { Env } from "./types";
 import { signRelayBody } from "./lib/relay-hmac";
+import { archiveOutboundCopy } from "./lib/archive";
 
 export interface SendEmailParams {
 	to: string | string[];
@@ -127,20 +128,86 @@ export function resolveRelayBase(env: Env, from: SendEmailParams["from"]): strin
 	return relays[domain] ?? null;
 }
 
+/** Optional per-send context for sendVia (archive journaling). */
+export interface SendViaOptions {
+	/**
+	 * When provided, the best-effort archive journal write rides
+	 * ctx.waitUntil so its completion is guaranteed without delaying the
+	 * caller. Without it, the (already caught, never-rejecting) journal
+	 * promise is left DETACHED — it is never awaited inline, because a
+	 * slow/hung archive DO after a successful send would stall the caller
+	 * (e.g. an agent tool call in lib/tools.ts), and a stalled tool call can
+	 * trigger a retry → duplicate real send. DO-context callers keep running
+	 * detached promises; plain Worker callers should pass ctx to guarantee
+	 * the journal completes. Typed structurally so both the workers-types
+	 * ExecutionContext and Hono's c.executionCtx satisfy it.
+	 */
+	ctx?: { waitUntil(promise: Promise<unknown>): void };
+	/**
+	 * R2 keys of attachment blobs the caller already stored for this message
+	 * (attachments/<emailId>/<attId>/<filename>). The archive records these
+	 * REFERENCES; attachment bytes are never duplicated.
+	 */
+	attachmentKeys?: string[];
+}
+
+/**
+ * Best-effort outbound journal into the agents@ archive mailbox
+ * (EMAIL-CASCADE.md PROPOSAL v2 §(b)). Runs only AFTER a successful send.
+ * FAILURE-ISOLATED: the returned promise never rejects — archive errors are
+ * logged and swallowed so they can never fail or delay the actual send.
+ */
+function journalOutbound(
+	env: Env,
+	params: SendEmailParams,
+	sentMessageId: string,
+	opts?: SendViaOptions,
+): Promise<void> {
+	return archiveOutboundCopy(env, params, sentMessageId || null, opts?.attachmentKeys)
+		.then((outcome) => {
+			// "skipped:disabled" is the steady state when the archive is off —
+			// logging it per-send would be pure noise.
+			if (outcome !== "archived" && outcome !== "skipped:disabled") {
+				console.log(`Outbound archive skipped (${outcome})`);
+			}
+		})
+		.catch((e) => {
+			console.error("Outbound archive write failed (send unaffected):", (e as Error).message);
+		});
+}
+
+/**
+ * Dispatch the journal promise without ever blocking the caller: ride
+ * ctx.waitUntil when available, otherwise leave it detached (it never
+ * rejects — see journalOutbound). The send result must never wait on it.
+ */
+function scheduleJournal(opts: SendViaOptions | undefined, journal: Promise<void>): void {
+	if (opts?.ctx) opts.ctx.waitUntil(journal);
+	// else: detached on purpose — see SendViaOptions.ctx.
+}
+
 /**
  * Send an email, delegating to a per-account relay when the from-domain is
  * remote. This is the single send entry point the app should use (reply,
  * forward, compose, agent auto-send). Local domains keep the exact prior
  * behavior: a direct env.EMAIL.send() via sendEmail().
+ *
+ * After every successful send — local AND relayed — a forward-style journal
+ * copy is filed into the archive mailbox (see journalOutbound above). The
+ * journal is best-effort and can never fail OR delay the send: it is never
+ * awaited on the send path (waitUntil with opts.ctx, detached without).
  */
 export async function sendVia(
 	env: Env,
 	params: SendEmailParams,
+	opts?: SendViaOptions,
 ): Promise<{ messageId: string }> {
 	const relayBase = resolveRelayBase(env, params.from);
 	if (!relayBase) {
 		// LOCAL domain — unchanged direct send.
-		return sendEmail(env.EMAIL, params);
+		const result = await sendEmail(env.EMAIL, params);
+		scheduleJournal(opts, journalOutbound(env, params, result.messageId, opts));
+		return result;
 	}
 
 	// REMOTE domain — delegate to the account's relay over HMAC-signed HTTPS.
@@ -181,5 +248,7 @@ export async function sendVia(
 		throw new Error(`relay ${relayBase}/send returned ${res.status}: ${detail.slice(0, 200)}`);
 	}
 	const result = (await res.json().catch(() => ({}))) as { messageId?: string };
-	return { messageId: result.messageId ?? "" };
+	const sent = { messageId: result.messageId ?? "" };
+	scheduleJournal(opts, journalOutbound(env, params, sent.messageId, opts));
+	return sent;
 }
