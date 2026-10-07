@@ -10,6 +10,7 @@ import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { applyMigrations, mailboxMigrations } from "./migrations";
+import { exportCounts, exportEmails, exportFolders } from "../lib/export";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -107,6 +108,21 @@ export class MailboxDO extends DurableObject<Env> {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
 		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+	}
+
+	// ── Read-only export (StartupsStudio/sb#337) ───────────────────
+	// SELECTs only: every row (soft-deleted too) for the move to api.sb.
+
+	async exportEmails(opts: { after?: string | null; limit?: number } = {}) {
+		return exportEmails(this.ctx.storage.sql, opts);
+	}
+
+	async exportCounts() {
+		return exportCounts(this.ctx.storage.sql);
+	}
+
+	async exportFolders() {
+		return exportFolders(this.ctx.storage.sql);
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────

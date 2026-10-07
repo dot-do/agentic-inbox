@@ -18,6 +18,8 @@ import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
 import type { Principal } from "./lib/access";
 import { gateAgentRequest, gateMcpRequest } from "./lib/gates";
+import { apiSbOn, type ApiSbEnv } from "./lib/api-sb";
+import { apiSbBackend, PRINCIPALS } from "./routes/api-sb-backend";
 
 export { MailboxDO } from "./durableObject";
 export { EmailAgent } from "./agent";
@@ -59,7 +61,7 @@ app.use("*", async (c, next) => {
 
 	// The server-to-server HMAC endpoints below carry no cookies and no
 	// redirect_uri, so they are left on whatever origin the caller used.
-	const serverToServer = c.req.path === "/api/v1/ingest" || c.req.path === "/api/v1/_admin/read";
+	const serverToServer = c.req.path === "/api/v1/ingest" || c.req.path === "/api/v1/_admin/read" || c.req.path === "/api/v1/_admin/export";
 
 	// Move browsers to the canonical origin (https, no trailing-dot host)
 	// before anything else: a sign-in started on http://emails.do sends an
@@ -92,6 +94,12 @@ app.use("*", async (c, next) => {
 		return next();
 	}
 
+	// Server-to-server read-only export (POST /api/v1/_admin/export) for the
+	// move to api.sb (StartupsStudio/sb#337): HMAC-authed by its own handler.
+	if (c.req.path === "/api/v1/_admin/export") {
+		return next();
+	}
+
 	const r = await authenticate(c, c.env);
 	if (!r.ok) {
 		return r.response;
@@ -120,6 +128,18 @@ const serveMcp = async (c: Context<AppEnv>) => {
 };
 app.all("/mcp", (c) => serveMcp(c));
 app.all("/mcp/*", (c) => serveMcp(c));
+
+// emails.do as a client of api.sb (StartupsStudio/sb#337): with MAIL_BACKEND
+// = "api.sb" the UI's mailbox routes read and send through api.sb's email
+// primitive; unset, nothing changes. See workers/routes/api-sb-backend.ts.
+const mailOnApiSb = apiSbBackend();
+const serveFromApiSb = async (c: Context<AppEnv>, next: () => Promise<void>) => {
+	if (!apiSbOn(c.env as Env & ApiSbEnv)) return next();
+	PRINCIPALS.set(c.req.raw, c.get("principal"));
+	return mailOnApiSb.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
+};
+app.all("/api/v1/mailboxes", serveFromApiSb);
+app.all("/api/v1/mailboxes/*", serveFromApiSb);
 
 // Mount the API routes
 app.route("/", apiApp);

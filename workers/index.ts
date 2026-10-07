@@ -24,6 +24,7 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import type { ExportEmail } from "./lib/export";
 import {
 	canManageMailbox,
 	filterAccessibleMailboxes,
@@ -466,6 +467,63 @@ app.post("/api/v1/_admin/read", async (c) => {
 	const emails = await stub.getEmails({ folder: Folders.INBOX, limit: req.limit ?? 20 });
 	return c.json({ mailbox: req.mailbox, count: emails.length, emails });
 });
+
+// POST /api/v1/_admin/export — HMAC-authed (RELAY_SECRET) READ-ONLY export
+// for the move to api.sb's email primitive (StartupsStudio/sb#337). Bodies:
+//   {mailboxes: true}                          every mailbox: settings, ACL, tombstone
+//   {counts: address}                          its row counts (deleted rows too)
+//   {emails: address, after?, limit?, content?} a page of rows by id, with
+//                                              attachments (base64 bytes when content)
+// Only SELECTs and R2 reads: it never writes the mailbox, its objects or its ACL.
+app.post("/api/v1/_admin/export", async (c) => {
+	const rawBody = await c.req.text();
+	const verified = await verifyRelayRequest(c.env.RELAY_SECRET ?? "", rawBody, c.req.header(RELAY_SIG_HEADER), c.req.header(RELAY_TS_HEADER));
+	if (!verified.ok) return c.json({ error: "unauthorized", reason: verified.reason }, 401);
+	let req: { mailboxes?: boolean; counts?: string; emails?: string; after?: string; limit?: number; content?: boolean };
+	try { req = JSON.parse(rawBody); } catch { return c.json({ error: "bad_request" }, 400); }
+
+	if (req.mailboxes) return c.json({ mailboxes: await exportMailboxes(c.env.BUCKET) });
+	const address = (req.counts ?? req.emails ?? "").toLowerCase();
+	if (!address) return c.json({ error: "bad_request", reason: "mailboxes, counts or emails is required" }, 400);
+	// never mint a DO for an address emails.do never had
+	if (!(await c.env.BUCKET.head(`mailboxes/${address}.json`))) return c.json({ error: "not_found", reason: `no mailbox ${address}` }, 404);
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(address)) as unknown as {
+		exportCounts(): Promise<unknown>;
+		exportFolders(): Promise<unknown>;
+		exportEmails(o: { after?: string | null; limit?: number }): Promise<{ emails: ExportEmail[]; next: string | null }>;
+	};
+	if (req.counts) return c.json({ mailbox: address, counts: await stub.exportCounts(), folders: await stub.exportFolders() });
+	const page = await stub.exportEmails({ after: req.after ?? null, limit: req.limit });
+	if (req.content) {
+		for (const e of page.emails) for (const a of e.attachments) {
+			const obj = await c.env.BUCKET.get(a.key);
+			if (obj) a.content = bytesToBase64(new Uint8Array(await obj.arrayBuffer()));
+		}
+	}
+	return c.json({ mailbox: address, ...page });
+});
+
+/** Every `mailboxes/<address>.json`, R2 cursor by cursor, with its ACL and tombstone. */
+async function exportMailboxes(bucket: R2Bucket) {
+	const out: { address: string; settings: unknown; acl: unknown; deleted: unknown }[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await bucket.list({ prefix: "mailboxes/", ...(cursor ? { cursor } : {}) });
+		for (const obj of page.objects) {
+			const address = obj.key.slice("mailboxes/".length).replace(/\.json$/, "");
+			const json = async (key: string) => { const o = await bucket.get(key); if (!o) return null; try { return await o.json(); } catch { return null; } };
+			out.push({ address, settings: await json(obj.key), acl: await getMailboxAcl(bucket, address), deleted: await json(mailboxTombstoneKey(address)) });
+		}
+		cursor = page.truncated ? page.cursor : undefined;
+	} while (cursor);
+	return out;
+}
+
+function bytesToBase64(b: Uint8Array): string {
+	let s = "";
+	for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+	return btoa(s);
+}
 
 // -- Receive inbound email ------------------------------------------
 
