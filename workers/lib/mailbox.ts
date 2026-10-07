@@ -4,17 +4,24 @@
 
 /**
  * Hono middleware to handle repetitive Mailbox Durable Object instantiation.
- * Checks if the mailbox exists in R2, then instantiates the DO stub
- * and attaches it to the Hono context (`c.var.mailboxStub`).
+ * Checks the mailbox exists in R2 (and is not soft-deleted), checks the
+ * authenticated principal may access it (workers/lib/access.ts — deny by
+ * default), then instantiates the DO stub and attaches it to the Hono
+ * context (`c.var.mailboxStub`).
  */
 import { createMiddleware } from "hono/factory";
 import type { MailboxDO } from "../durableObject";
 import type { Env } from "../types";
+import { canAccessMailbox, isMailboxDeleted, type Principal } from "./access";
 
 export type MailboxContext = {
 	Bindings: Env;
 	Variables: {
 		mailboxStub: DurableObjectStub<MailboxDO>;
+		/** Set by the auth middleware in workers/app.ts. */
+		principal: Principal;
+		/** Decoded mailbox id, set by requireMailbox. */
+		mailboxId: string;
 	};
 };
 
@@ -23,10 +30,16 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
 	const mailboxId = decodeURIComponent(rawId);
 
-	// Verify mailbox exists
+	// Verify mailbox exists and has not been soft-deleted
 	const key = `mailboxes/${mailboxId}.json`;
 	const obj = await c.env.BUCKET.head(key);
-	if (!obj) {
+	if (!obj || (await isMailboxDeleted(c.env.BUCKET, mailboxId))) {
+		return c.json({ error: "Not found" }, 404);
+	}
+
+	// Authorize. A mailbox the caller may not read answers exactly like a
+	// missing one, so access checks do not leak which addresses exist.
+	if (!(await canAccessMailbox(c.env, c.get("principal"), mailboxId))) {
 		return c.json({ error: "Not found" }, 404);
 	}
 
@@ -36,6 +49,7 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	const stub = ns.get(id);
 
 	c.set("mailboxStub", stub);
-	
+	c.set("mailboxId", mailboxId);
+
 	await next();
 });

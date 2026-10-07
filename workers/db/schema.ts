@@ -4,10 +4,15 @@
 
 import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
 
+// Rows are never hard-deleted (keep-everything, ADR-0005). The legacy
+// ON DELETE CASCADE foreign keys below still exist in the SQL schema, but
+// migration 10_forbid_hard_deletes makes any DELETE abort; deletion is the
+// nullable deleted_at marker, filtered out on every read.
 export const folders = sqliteTable("folders", {
 	id: text("id").primaryKey(),
 	name: text("name").notNull().unique(),
 	is_deletable: integer("is_deletable").notNull().default(1),
+	deleted_at: text("deleted_at"),
 });
 
 export const emails = sqliteTable("emails", {
@@ -29,6 +34,7 @@ export const emails = sqliteTable("emails", {
 	thread_id: text("thread_id"),
 	message_id: text("message_id"),
 	raw_headers: text("raw_headers"),
+	deleted_at: text("deleted_at"),
 });
 
 export const attachments = sqliteTable("attachments", {

@@ -97,7 +97,9 @@ interface EmailListResponse {
 const api = {
 	// Config
 	getConfig: () =>
-		get<{ domains: string[]; emailAddresses: string[] }>("/api/v1/config"),
+		get<{ domains: string[]; emailAddresses: string[]; dynamicDomains?: boolean }>("/api/v1/config"),
+	searchDomains: (q: string) =>
+		get<{ domains: string[]; dynamic: boolean }>("/api/v1/domains", { params: { q } }),
 
 	// Mailboxes
 	listMailboxes: () => get<Mailbox[]>("/api/v1/mailboxes"),

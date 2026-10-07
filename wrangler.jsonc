@@ -1,7 +1,22 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "agentic-inbox",
+	"account_id": "b6641681fe423910342b9ffa1364c76d",
 	"compatibility_date": "2025-11-28",
+	"routes": [
+		{
+			"pattern": "emails.do",
+			"custom_domain": true
+		},
+		{
+			// Interim UI door: this hostname is covered by the pre-existing
+			// "workflows.do" Access app (aud in POLICY_AUD), letting the UI open
+			// without Access:Edit API permission. Swap for an emails.do Access
+			// app + aud when one exists, then drop this route.
+			"pattern": "api.workflows.do",
+			"custom_domain": true
+		}
+	],
 	"main": "./workers/app.ts",
 	"observability": {
 		"enabled": true
@@ -13,8 +28,35 @@
 		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		"DOMAINS": "emails.do",
+		"EMAIL_ADDRESSES": [],
+		// Auth mode: "cf-access" (default) or "id.org.ai" (OIDC via id.org.ai).
+		// id.org.ai mode also requires secrets ID_ORG_AI_CLIENT_ID and SESSION_SECRET.
+		"AUTH_MODE": "id.org.ai",
+		// Per-mailbox access (workers/lib/access.ts): owner + granted members;
+		// admins come from the MAILBOX_ADMINS SECRET (emails or subs), not a var.
+		// Without it, mailboxes that have no ACL yet (everything created before
+		// per-mailbox access) are readable only by their address holder.
+		"ID_ORG_AI_ISSUER": "https://id.org.ai",
+		// Email cascade registry: send-as domain -> per-account relay base URL.
+		// Seeded from ~/projects/domains/data/email-zones.tsv. Domains absent
+		// here are LOCAL (.do account) and sent directly via env.EMAIL.
+		// RELAY_SECRET is a wrangler SECRET, never a var.
+		"EMAIL_RELAYS": "{\"longtail.studio\":\"https://relay.longtail.studio\"}",
+		// Estate email ledger (EMAIL-CASCADE.md §(b), founder ruling
+		// 2026-08-20): ARCHIVE_ADDRESS is the REAL Google Workspace archive
+		// mailbox — every outbound/inbound message produces a [ledger:*]
+		// journal email DELIVERED there (CF Email Service → Google MX) from
+		// the dedicated LEDGER_ADDRESS sender identity, plus a queryable
+		// index record in the LEDGER_ADDRESS MailboxDO. Loop-guarded
+		// (X-Ledger-Copy / ledger sender never journaled); best-effort — a
+		// ledger failure never blocks delivery. ARCHIVE_ENABLED=false is the
+		// kill switch. ⚠️ VOLUME: one Google-delivered email per message —
+		// at tens of thousands/day this hits Workspace receiving limits; the
+		// DO index is the scale path (see workers/lib/archive.ts header).
+		"ARCHIVE_ADDRESS": "agents@do.industries",
+		"LEDGER_ADDRESS": "ledger@emails.do",
+		"ARCHIVE_ENABLED": true
 	},
 	"send_email": [
 		{

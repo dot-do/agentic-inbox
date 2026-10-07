@@ -6,8 +6,10 @@ import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
 import { z } from "zod";
-import { sendEmail } from "./email-sender";
+import { sendVia } from "./email-sender";
+import { archiveInboundCopy } from "./lib/archive";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
+import { verifyRelayRequest, RELAY_SIG_HEADER, RELAY_TS_HEADER } from "./lib/relay-hmac";
 import {
 	validateSender,
 	SenderValidationError,
@@ -15,15 +17,32 @@ import {
 	buildThreadingHeaders,
 	listMailboxes,
 } from "./lib/email-helpers";
+import { getAgentByName } from "agents";
 import { SendEmailRequestSchema } from "./lib/schemas";
+import { listDomains, searchDomains } from "./lib/domains";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	canManageMailbox,
+	filterAccessibleMailboxes,
+	getMailboxAcl,
+	isAdmin,
+	isMailboxDeleted,
+	mailboxTombstoneKey,
+	primaryId,
+	putMailboxAcl,
+} from "./lib/access";
 
 type AppContext = Context<MailboxContext>;
 
 // -- Request body schemas (kept for validation) ---------------------
+
+const MembersBody = z.object({
+	members: z.array(z.string().min(1)).optional(),
+	owner: z.string().min(1).optional(),
+});
 
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
@@ -81,22 +100,37 @@ app.use("/api/*", cors({
 		return undefined;
 	},
 }));
+// Every mailbox-scoped route (the mailbox itself and everything under it) is
+// gated by requireMailbox: exists, not soft-deleted, and the principal may
+// access it (owner / granted member / admin — deny by default).
+app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
 // -- Config ---------------------------------------------------------
 
-app.get("/api/v1/config", (c) => {
-	const domainsRaw = c.env.DOMAINS || "";
-	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
+app.get("/api/v1/config", async (c) => {
+	const { domains, dynamic } = await listDomains(c.env);
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
-	return c.json({ domains, emailAddresses });
+	return c.json({ domains, emailAddresses, dynamicDomains: dynamic });
+});
+
+// Searchable domain suggestions for the create-mailbox combobox. Suggestions
+// only — mailbox addresses are free text; see workers/lib/domains.ts.
+app.get("/api/v1/domains", async (c) => {
+	const { domains, dynamic } = await listDomains(c.env);
+	const q = c.req.query("q") ?? "";
+	return c.json({ domains: searchDomains(domains, q), dynamic });
 });
 
 // -- Mailboxes ------------------------------------------------------
 
 app.get("/api/v1/mailboxes", async (c) => {
+	// Only the mailboxes this principal may read; soft-deleted ones are hidden.
 	const allMailboxes = await listMailboxes(c.env.BUCKET);
-	return c.json(allMailboxes.map((m) => ({ ...m, name: m.id })));
+	const visible = await filterAccessibleMailboxes(c.env, c.get("principal"), allMailboxes);
+	const live = (await Promise.all(visible.map(async (m) => ((await isMailboxDeleted(c.env.BUCKET, m.id)) ? null : m))))
+		.filter((m): m is (typeof visible)[number] => m !== null);
+	return c.json(live.map((m) => ({ ...m, name: m.id })));
 });
 
 app.post("/api/v1/mailboxes", async (c) => {
@@ -108,9 +142,17 @@ app.post("/api/v1/mailboxes", async (c) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
+	// Soft-deleted mailboxes keep their key forever (keep-everything), so the
+	// address stays taken; an admin can restore it instead.
+	if (await isMailboxDeleted(c.env.BUCKET, email)) return c.json({ error: "Mailbox already exists" }, 409);
+	const principal = c.get("principal");
+	const owner = principal ? primaryId(principal) : undefined;
+	if (!owner && !isAdmin(c.env, principal)) return c.json({ error: "Forbidden" }, 403);
 	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
+	// The creator owns the mailbox; nobody else can read it until granted.
+	await putMailboxAcl(c.env.BUCKET, email, { owner, members: [] });
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
 	return c.json({ id: email, email, name, settings: finalSettings }, 201);
@@ -132,12 +174,39 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
 });
 
+// Soft delete (keep-everything, ADR-0005): write a tombstone recording who
+// deleted the mailbox and when. The settings object, ACL, DO rows and R2
+// attachment blobs are all kept; the mailbox just disappears from reads.
 app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const key = `mailboxes/${mailboxId}.json`;
-	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.delete(key); // TODO: also delete DO data and R2 attachment blobs
+	const mailboxId = c.get("mailboxId");
+	if (!(await canManageMailbox(c.env, c.get("principal"), mailboxId))) return c.json({ error: "Forbidden" }, 403);
+	const principal = c.get("principal");
+	await c.env.BUCKET.put(mailboxTombstoneKey(mailboxId), JSON.stringify({
+		deleted_at: new Date().toISOString(),
+		deleted_by: principal ? primaryId(principal) ?? null : null,
+	}));
 	return c.body(null, 204);
+});
+
+// -- Mailbox access (owner + granted members) -----------------------
+
+app.get("/api/v1/mailboxes/:mailboxId/members", async (c: AppContext) => {
+	const acl = await getMailboxAcl(c.env.BUCKET, c.get("mailboxId"));
+	return c.json({ owner: acl?.owner ?? null, members: acl?.members ?? [] });
+});
+
+// Replace the member list (and optionally transfer ownership). Only the
+// owner, the address holder, or an admin may change who has access.
+app.put("/api/v1/mailboxes/:mailboxId/members", async (c: AppContext) => {
+	const mailboxId = c.get("mailboxId");
+	if (!(await canManageMailbox(c.env, c.get("principal"), mailboxId))) return c.json({ error: "Forbidden" }, 403);
+	const body = MembersBody.parse(await c.req.json());
+	const current = (await getMailboxAcl(c.env.BUCKET, mailboxId)) ?? { members: [] };
+	const acl = await putMailboxAcl(c.env.BUCKET, mailboxId, {
+		owner: body.owner ?? current.owner,
+		members: body.members ?? current.members,
+	});
+	return c.json({ owner: acl.owner ?? null, members: acl.members });
 });
 
 // -- Emails ---------------------------------------------------------
@@ -202,10 +271,13 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	}, attachmentData);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendVia(c.env, {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
+		}, {
+			ctx: c.executionCtx,
+			attachmentKeys: attachmentData.map((a) => `attachments/${messageId}/${a.id}/${a.filename}`),
 		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
@@ -241,11 +313,11 @@ app.put("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
 	return email ? c.json(email) : c.json({ error: "Email not found" }, 404);
 });
 
+// Soft delete (keep-everything, ADR-0005): the DO stamps deleted_at and every
+// read filters it out. The row and its R2 attachment blobs are kept.
 app.delete("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
-	const id = c.req.param("id")!;
-	const attachments = await c.var.mailboxStub.deleteEmail(id);
-	if (attachments === null) return c.json({ error: "Not found" }, 404);
-	if (attachments.length > 0) await c.env.BUCKET.delete(attachments.map((att: any) => `attachments/${id}/${att.id}/${att.filename}`));
+	const result = await c.var.mailboxStub.deleteEmail(c.req.param("id")!);
+	if (result === null) return c.json({ error: "Not found" }, 404);
 	return c.body(null, 204);
 });
 
@@ -315,7 +387,7 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 	const emailId = c.req.param("emailId")!;
 	const attachmentId = c.req.param("attachmentId")!;
 	const attachment = await c.var.mailboxStub.getAttachment(attachmentId);
-	if (!attachment) return c.json({ error: "Attachment not found" }, 404);
+	if (!attachment || attachment.email_id !== emailId) return c.json({ error: "Attachment not found" }, 404);
 	const obj = await c.env.BUCKET.get(`attachments/${emailId}/${attachmentId}/${attachment.filename}`);
 	if (!obj) return c.json({ error: "Attachment file not found" }, 404);
 	const headers = new Headers();
@@ -323,6 +395,76 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 	const sanitized = attachment.filename.replace(/[\x00-\x1f"\\]/g, "_");
 	headers.set("Content-Disposition", `attachment; filename="${sanitized}"; filename*=UTF-8''${encodeURIComponent(attachment.filename)}`);
 	return new Response(obj.body, { headers });
+});
+
+// -- Relay ingest (inbound cascade) ---------------------------------
+
+// POST /api/v1/ingest — a per-account relay worker (e.g. relay.longtail.studio
+// in the Semantics.dev account) forwards normalized inbound mail here for
+// domains the center cannot catch locally. This endpoint is EXEMPT from the
+// browser/session auth middleware (see the bypass in workers/app.ts) and is
+// instead authenticated by the shared RELAY_SECRET HMAC, verified below over
+// the raw body + timestamp header. On success it stores into the correct
+// MailboxDO INBOX exactly as receiveEmail does and fires the auto-draft trigger.
+app.post("/api/v1/ingest", async (c) => {
+	const rawBody = await c.req.text();
+
+	const verified = await verifyRelayRequest(
+		c.env.RELAY_SECRET ?? "",
+		rawBody,
+		c.req.header(RELAY_SIG_HEADER),
+		c.req.header(RELAY_TS_HEADER),
+	);
+	if (!verified.ok) {
+		console.warn(`/api/v1/ingest rejected: ${verified.reason}`);
+		return c.json({ error: "unauthorized", reason: verified.reason }, 401);
+	}
+
+	let msg: NormalizedInbound;
+	try {
+		msg = JSON.parse(rawBody) as NormalizedInbound;
+	} catch {
+		return c.json({ error: "bad_request", reason: "body is not valid JSON" }, 400);
+	}
+	if (!Array.isArray(msg.to) || typeof msg.from !== "string") {
+		return c.json({ error: "bad_request", reason: "to[] and from are required" }, 400);
+	}
+
+	// storeInboundEmail returns "ignored" (no matching/existing mailbox) or
+	// "stored" — a clean 200 either way, never a 500 (which would make CF Email
+	// Routing retry on the relay side for an unknown recipient).
+	const result = await storeInboundEmail(msg, c.env, c.executionCtx as ExecutionContext);
+	return c.json({ status: result });
+});
+
+// POST /api/v1/_admin/read — HMAC-authed (RELAY_SECRET) operator read of recent
+// mail from a mailbox, or a listing of mailboxes when { list: true }. Bypasses
+// the browser/OIDC session (server-to-server only). Body: {mailbox, limit?} | {list:true}.
+app.post("/api/v1/_admin/read", async (c) => {
+	const rawBody = await c.req.text();
+	const verified = await verifyRelayRequest(
+		c.env.RELAY_SECRET ?? "",
+		rawBody,
+		c.req.header(RELAY_SIG_HEADER),
+		c.req.header(RELAY_TS_HEADER),
+	);
+	if (!verified.ok) return c.json({ error: "unauthorized", reason: verified.reason }, 401);
+
+	let req: { mailbox?: string; limit?: number; list?: boolean; emailId?: string };
+	try { req = JSON.parse(rawBody); } catch { return c.json({ error: "bad_request" }, 400); }
+
+	if (req.list) {
+		const boxes = await listMailboxes(c.env.BUCKET);
+		return c.json({ mailboxes: boxes.map((m) => m.id) });
+	}
+	if (!req.mailbox) return c.json({ error: "bad_request", reason: "mailbox required" }, 400);
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(req.mailbox.toLowerCase()));
+	if (req.emailId) {
+		const full = await stub.getEmail(req.emailId); // includes full body
+		return c.json({ mailbox: req.mailbox, email: full });
+	}
+	const emails = await stub.getEmails({ folder: Folders.INBOX, limit: req.limit ?? 20 });
+	return c.json({ mailbox: req.mailbox, count: emails.length, emails });
 });
 
 // -- Receive inbound email ------------------------------------------
@@ -345,68 +487,176 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
+/**
+ * Normalized inbound message — the shared shape for storeInboundEmail(). It is
+ * produced two ways that both land in the exact same MailboxDO write:
+ *   1. receiveEmail() parses raw MIME (Cloudflare Email Routing on the .do zone)
+ *   2. the relay's POST /api/v1/ingest body (a remote account's inbound mail)
+ * Header-ish fields (messageId/inReplyTo/references) are RAW as parsed by
+ * PostalMime; storeInboundEmail does the `<...>` extraction so both callers
+ * stay identical.
+ */
+interface NormalizedInbound {
+	to: string[];
+	from: string;
+	subject: string;
+	html?: string;
+	text?: string;
+	messageId?: string | null; // raw, may contain angle brackets
+	inReplyTo?: string | null; // raw
+	references?: string | null; // raw, space-separated
+	cc?: string[];
+	bcc?: string[];
+	rawHeaders?: unknown; // stringified verbatim into raw_headers
+}
+
+/**
+ * Canonical store-to-INBOX + auto-draft path, factored out of receiveEmail so
+ * relayed mail (POST /api/v1/ingest) stores byte-for-byte identically. Resolves
+ * the mailbox by recipient (same allowedAddresses / mailbox-exists logic),
+ * writes to the MailboxDO INBOX with the same schema, and fires the same
+ * onNewEmail auto-draft trigger. Returns "ignored" (no matching/existing
+ * mailbox) or "stored" — never throws for the ignore cases so callers can
+ * return a clean response instead of a 500/retry.
+ */
+async function storeInboundEmail(
+	msg: NormalizedInbound,
+	env: Env,
+	ctx: ExecutionContext,
+	// Optional attachment materializer. Invoked only AFTER the mailbox-exists
+	// check, with the freshly generated email id so R2 keys and the DB row's
+	// email_id stay in lockstep. The local MIME path supplies this; the relay
+	// ingest path has no attachment blobs and omits it.
+	storeAttachmentsFor?: (messageId: string) => Promise<StoredAttachment[]>,
+): Promise<"ignored" | "stored"> {
+	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
+	const allRecipients = msg.to.map((a) => a?.toLowerCase()).filter(Boolean) as string[];
+	const ccRecipients = (msg.cc || []).map((a) => a?.toLowerCase()).filter(Boolean) as string[];
+	const bccRecipients = (msg.bcc || []).map((a) => a?.toLowerCase()).filter(Boolean) as string[];
+
+	let mailboxId: string | undefined;
+	if (allowedAddresses.length > 0) {
+		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
+		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return "ignored"; }
+	} else { mailboxId = allRecipients[0]; }
+	if (!mailboxId) { console.log("Ignoring email: no valid recipient address"); return "ignored"; }
+
+	const messageId = crypto.randomUUID();
+	// Wildcard catch-all: when EMAIL_ADDRESSES imposes no allowlist, the inbox is
+	// a true catch-all for every routed domain — auto-provision a mailbox for any
+	// recipient rather than dropping the mail. (2FA/verification mail goes to
+	// per-service addresses that were never hand-created; dropping them is the bug.)
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		if (allowedAddresses.length > 0) { console.log(`Ignoring email for ${mailboxId}: not in EMAIL_ADDRESSES allowlist`); return "ignored"; }
+		const defaultSettings = { fromName: mailboxId, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
+		await env.BUCKET.put(`mailboxes/${mailboxId}.json`, JSON.stringify(defaultSettings));
+		console.log(`Auto-created mailbox ${mailboxId} (wildcard catch-all)`);
+	}
+
+	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+
+	const attachmentData: StoredAttachment[] = storeAttachmentsFor ? await storeAttachmentsFor(messageId) : [];
+
+	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
+	const inReplyTo = msg.inReplyTo ? extractMsgId(msg.inReplyTo) : null;
+	const emailReferences = msg.references ? msg.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
+	let threadId = emailReferences[0] || inReplyTo || messageId;
+
+	if (!inReplyTo && emailReferences.length === 0) {
+		const subjectThread = await (stub as any).findThreadBySubject(msg.subject || "", msg.from || undefined);
+		if (subjectThread) threadId = subjectThread;
+	}
+
+	const originalMessageId = msg.messageId ? extractMsgId(msg.messageId) : null;
+	const sender = (msg.from || "").toLowerCase();
+
+	await stub.createEmail(Folders.INBOX, {
+		id: messageId, subject: msg.subject || "",
+		sender, recipient: allRecipients.join(", "),
+		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
+		date: new Date().toISOString(), // uses receive time, not the email's Date header
+		body: msg.html || msg.text || "",
+		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(msg.rawHeaders ?? []),
+	}, attachmentData);
+
+	// Estate ledger (founder ruling 2026-08-20): deliver a [ledger:inbound]
+	// journal email to the real archive mailbox (agents@do.industries,
+	// Google Workspace) and index it in the ledger DO (ledger@emails.do).
+	// Covers BOTH inbound paths — direct Email Routing (receiveEmail) and
+	// the relay /api/v1/ingest — since both flow through here. Best-effort
+	// via waitUntil + catch: a ledger failure never fails or delays the real
+	// delivery. Attachment R2 keys are passed as references; bytes are not
+	// duplicated.
+	ctx.waitUntil(
+		archiveInboundCopy(
+			env, msg, mailboxId,
+			attachmentData.map((a) => `attachments/${messageId}/${a.id}/${a.filename}`),
+		)
+			.then((outcome) => {
+				// "skipped:disabled" is steady-state when the archive is off — not worth a log line per message.
+				if (outcome !== "archived" && outcome !== "skipped:disabled") console.log(`Inbound archive skipped (${outcome})`);
+			})
+			.catch((e) => console.error("Inbound archive write failed (delivery unaffected):", (e as Error).message)),
+	);
+
+	// Agents SDK DOs must be addressed via getAgentByName (it sets the
+	// namespace/room headers) — a raw idFromName stub 500s inside the SDK.
+	ctx.waitUntil(
+		getAgentByName(env.EMAIL_AGENT, mailboxId)
+			.then((agentStub) =>
+				agentStub.fetch(new Request("https://agents/onNewEmail", {
+					method: "POST", headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ mailboxId, emailId: messageId, sender, subject: msg.subject || "", threadId }),
+				})),
+			)
+			.catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)),
+	);
+	return "stored";
+}
+
 async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
-
-	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
-
-	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
-
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
+	// Attachments are stored inside storeInboundEmail (after the mailbox-exists
+	// check) so their R2 keys and email_id match the generated email id, exactly
+	// as the pre-refactor path did.
+	const storeAttachmentsFor = async (messageId: string): Promise<StoredAttachment[]> => {
+		const attachmentData: StoredAttachment[] = [];
+		if (parsedEmail.attachments) {
+			for (const att of parsedEmail.attachments) {
+				const attId = crypto.randomUUID();
+				const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+				await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
+				attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
+					size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+					content_id: att.contentId || null, disposition: att.disposition || "attachment" });
+			}
 		}
-	}
+		return attachmentData;
+	};
 
-	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
-	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
-	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	let threadId = emailReferences[0] || inReplyTo || messageId;
-
-	if (!inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
-		if (subjectThread) threadId = subjectThread;
-	}
-
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
-
-	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
-		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
-		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
-	}, attachmentData);
-
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
-	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
-	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	await storeInboundEmail({
+		to: allRecipients,
+		from: parsedEmail.from?.address || "",
+		subject: parsedEmail.subject || "",
+		html: parsedEmail.html || undefined,
+		text: parsedEmail.text || undefined,
+		messageId: parsedEmail.messageId || null,
+		inReplyTo: parsedEmail.inReplyTo || null,
+		references: parsedEmail.references || null,
+		cc: ccRecipients,
+		bcc: bccRecipients,
+		rawHeaders: parsedEmail.headers,
+	}, env, ctx, storeAttachmentsFor);
 }
 
-export { app, receiveEmail };
+export { app, receiveEmail, storeInboundEmail };
+export type { NormalizedInbound };

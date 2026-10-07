@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import type { Context } from "hono";
-import { sendEmail } from "../email-sender";
+import { sendVia } from "../email-sender";
 import { storeAttachments } from "../lib/attachments";
 import type { EmailFull } from "../lib/schemas";
 import {
@@ -88,7 +88,7 @@ export async function handleReplyEmail(c: AppContext) {
 	await stub.markThreadRead(thread_id);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendVia(c.env, {
 			to,
 			cc,
 			bcc,
@@ -104,6 +104,9 @@ export async function handleReplyEmail(c: AppContext) {
 				contentId: att.contentId,
 			})),
 			headers: buildThreadingHeaders(originalMsgId, references),
+		}, {
+			ctx: c.executionCtx,
+			attachmentKeys: attachmentData.map((att) => `attachments/${messageId}/${att.id}/${att.filename}`),
 		}).catch((e) => {
 			console.error("Deferred reply delivery failed:", (e as Error).message);
 		}),
@@ -174,7 +177,7 @@ export async function handleForwardEmail(c: AppContext) {
 	);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendVia(c.env, {
 			to,
 			cc,
 			bcc,
@@ -189,6 +192,9 @@ export async function handleForwardEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
+		}, {
+			ctx: c.executionCtx,
+			attachmentKeys: attachmentData.map((att) => `attachments/${messageId}/${att.id}/${att.filename}`),
 		}).catch((e) => {
 			console.error("Deferred forward delivery failed:", (e as Error).message);
 		}),
