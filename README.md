@@ -3,6 +3,20 @@
   <p><em>A self-hosted email client with an AI agent, running entirely on Cloudflare Workers</em></p>
 </div>
 
+> [!WARNING]
+> **Marked for retirement (dot-do fork, emails.do).** The mail store moves to api.sb's email primitive
+> (StartupsStudio/sb#337; ADR-0025 Q145: emails.do's fork, `visibility-inbox` and `vis/apps/inbox` retire onto it).
+> This store is **kept, never deleted** (ADR-0005): its R2 bucket `agentic-inbox` and every MailboxDO stay as they
+> are, read-only for the move.
+>
+> - **Export, read-only:** `POST /api/v1/_admin/export` (HMAC, `RELAY_SECRET`) answers every mailbox and every row,
+>   soft-deleted ones too, for sb's importer (`poc/workers/api-sb-prototype/scripts/import-emails-do.ts`), which checks
+>   counts after.
+> - **Client of api.sb:** with `MAIL_BACKEND = "api.sb"` (plus `API_SB_STARTUP`, and the `API_SB_TOKEN` secret) the
+>   UI's mailbox routes read and send through api.sb (`workers/routes/api-sb-backend.ts`). Unset, nothing changes.
+> - **Order:** deploy this branch, import, check the counts, switch Email Routing to api.sb, set `MAIL_BACKEND`.
+>   New features go to api.sb, not here.
+
 Agentic Inbox lets you send, receive, and manage emails through a modern web interface -- all powered by your own Cloudflare account. Incoming emails arrive via [Cloudflare Email Routing](https://developers.cloudflare.com/email-routing/), each mailbox is isolated in its own [Durable Object](https://developers.cloudflare.com/durable-objects/) with a SQLite database, and attachments are stored in [R2](https://developers.cloudflare.com/r2/).
 
 An **AI-powered Email Agent** can read your inbox, search conversations, and draft replies -- built with the [Cloudflare Agents SDK](https://developers.cloudflare.com/agents/) and [Workers AI](https://developers.cloudflare.com/workers-ai/).
