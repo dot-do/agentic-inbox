@@ -168,4 +168,30 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
         `,
 	},
+	{
+		// Keep-everything (ADR-0005, law): deletes become a deleted_at marker
+		// that every read filters out. Additive only — nullable columns, no
+		// data rewritten, nothing dropped.
+		name: "9_add_soft_delete",
+		sql: txn(`
+            ALTER TABLE emails ADD COLUMN deleted_at TEXT;
+            ALTER TABLE folders ADD COLUMN deleted_at TEXT;
+        `),
+	},
+	{
+		// Belt and braces for 9_add_soft_delete: the original tables declare
+		// ON DELETE CASCADE foreign keys (folders -> emails -> attachments).
+		// Rebuilding the tables to drop them would not be additive, so instead
+		// any hard DELETE — direct or cascaded — now aborts at the database.
+		// Additive only: three triggers, no table or row touched.
+		name: "10_forbid_hard_deletes",
+		sql: `
+            CREATE TRIGGER IF NOT EXISTS keep_everything_emails BEFORE DELETE ON emails
+            BEGIN SELECT RAISE(ABORT, 'hard delete forbidden (keep-everything): set deleted_at'); END;
+            CREATE TRIGGER IF NOT EXISTS keep_everything_folders BEFORE DELETE ON folders
+            BEGIN SELECT RAISE(ABORT, 'hard delete forbidden (keep-everything): set deleted_at'); END;
+            CREATE TRIGGER IF NOT EXISTS keep_everything_attachments BEFORE DELETE ON attachments
+            BEGIN SELECT RAISE(ABORT, 'hard delete forbidden (keep-everything)'); END;
+        `,
+	},
 ];

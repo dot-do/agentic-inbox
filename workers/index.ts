@@ -24,10 +24,25 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	canManageMailbox,
+	filterAccessibleMailboxes,
+	getMailboxAcl,
+	isAdmin,
+	isMailboxDeleted,
+	mailboxTombstoneKey,
+	primaryId,
+	putMailboxAcl,
+} from "./lib/access";
 
 type AppContext = Context<MailboxContext>;
 
 // -- Request body schemas (kept for validation) ---------------------
+
+const MembersBody = z.object({
+	members: z.array(z.string().min(1)).optional(),
+	owner: z.string().min(1).optional(),
+});
 
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
@@ -85,6 +100,10 @@ app.use("/api/*", cors({
 		return undefined;
 	},
 }));
+// Every mailbox-scoped route (the mailbox itself and everything under it) is
+// gated by requireMailbox: exists, not soft-deleted, and the principal may
+// access it (owner / granted member / admin — deny by default).
+app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
 // -- Config ---------------------------------------------------------
@@ -106,8 +125,12 @@ app.get("/api/v1/domains", async (c) => {
 // -- Mailboxes ------------------------------------------------------
 
 app.get("/api/v1/mailboxes", async (c) => {
+	// Only the mailboxes this principal may read; soft-deleted ones are hidden.
 	const allMailboxes = await listMailboxes(c.env.BUCKET);
-	return c.json(allMailboxes.map((m) => ({ ...m, name: m.id })));
+	const visible = await filterAccessibleMailboxes(c.env, c.get("principal"), allMailboxes);
+	const live = (await Promise.all(visible.map(async (m) => ((await isMailboxDeleted(c.env.BUCKET, m.id)) ? null : m))))
+		.filter((m): m is (typeof visible)[number] => m !== null);
+	return c.json(live.map((m) => ({ ...m, name: m.id })));
 });
 
 app.post("/api/v1/mailboxes", async (c) => {
@@ -119,9 +142,17 @@ app.post("/api/v1/mailboxes", async (c) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
+	// Soft-deleted mailboxes keep their key forever (keep-everything), so the
+	// address stays taken; an admin can restore it instead.
+	if (await isMailboxDeleted(c.env.BUCKET, email)) return c.json({ error: "Mailbox already exists" }, 409);
+	const principal = c.get("principal");
+	const owner = principal ? primaryId(principal) : undefined;
+	if (!owner && !isAdmin(c.env, principal)) return c.json({ error: "Forbidden" }, 403);
 	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
+	// The creator owns the mailbox; nobody else can read it until granted.
+	await putMailboxAcl(c.env.BUCKET, email, { owner, members: [] });
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
 	return c.json({ id: email, email, name, settings: finalSettings }, 201);
@@ -143,12 +174,39 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
 });
 
+// Soft delete (keep-everything, ADR-0005): write a tombstone recording who
+// deleted the mailbox and when. The settings object, ACL, DO rows and R2
+// attachment blobs are all kept; the mailbox just disappears from reads.
 app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const key = `mailboxes/${mailboxId}.json`;
-	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.delete(key); // TODO: also delete DO data and R2 attachment blobs
+	const mailboxId = c.get("mailboxId");
+	if (!(await canManageMailbox(c.env, c.get("principal"), mailboxId))) return c.json({ error: "Forbidden" }, 403);
+	const principal = c.get("principal");
+	await c.env.BUCKET.put(mailboxTombstoneKey(mailboxId), JSON.stringify({
+		deleted_at: new Date().toISOString(),
+		deleted_by: principal ? primaryId(principal) ?? null : null,
+	}));
 	return c.body(null, 204);
+});
+
+// -- Mailbox access (owner + granted members) -----------------------
+
+app.get("/api/v1/mailboxes/:mailboxId/members", async (c: AppContext) => {
+	const acl = await getMailboxAcl(c.env.BUCKET, c.get("mailboxId"));
+	return c.json({ owner: acl?.owner ?? null, members: acl?.members ?? [] });
+});
+
+// Replace the member list (and optionally transfer ownership). Only the
+// owner, the address holder, or an admin may change who has access.
+app.put("/api/v1/mailboxes/:mailboxId/members", async (c: AppContext) => {
+	const mailboxId = c.get("mailboxId");
+	if (!(await canManageMailbox(c.env, c.get("principal"), mailboxId))) return c.json({ error: "Forbidden" }, 403);
+	const body = MembersBody.parse(await c.req.json());
+	const current = (await getMailboxAcl(c.env.BUCKET, mailboxId)) ?? { members: [] };
+	const acl = await putMailboxAcl(c.env.BUCKET, mailboxId, {
+		owner: body.owner ?? current.owner,
+		members: body.members ?? current.members,
+	});
+	return c.json({ owner: acl.owner ?? null, members: acl.members });
 });
 
 // -- Emails ---------------------------------------------------------
@@ -255,11 +313,11 @@ app.put("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
 	return email ? c.json(email) : c.json({ error: "Email not found" }, 404);
 });
 
+// Soft delete (keep-everything, ADR-0005): the DO stamps deleted_at and every
+// read filters it out. The row and its R2 attachment blobs are kept.
 app.delete("/api/v1/mailboxes/:mailboxId/emails/:id", async (c: AppContext) => {
-	const id = c.req.param("id")!;
-	const attachments = await c.var.mailboxStub.deleteEmail(id);
-	if (attachments === null) return c.json({ error: "Not found" }, 404);
-	if (attachments.length > 0) await c.env.BUCKET.delete(attachments.map((att: any) => `attachments/${id}/${att.id}/${att.filename}`));
+	const result = await c.var.mailboxStub.deleteEmail(c.req.param("id")!);
+	if (result === null) return c.json({ error: "Not found" }, 404);
 	return c.body(null, 204);
 });
 
@@ -329,7 +387,7 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 	const emailId = c.req.param("emailId")!;
 	const attachmentId = c.req.param("attachmentId")!;
 	const attachment = await c.var.mailboxStub.getAttachment(attachmentId);
-	if (!attachment) return c.json({ error: "Attachment not found" }, 404);
+	if (!attachment || attachment.email_id !== emailId) return c.json({ error: "Attachment not found" }, 404);
 	const obj = await c.env.BUCKET.get(`attachments/${emailId}/${attachmentId}/${attachment.filename}`);
 	if (!obj) return c.json({ error: "Attachment file not found" }, 404);
 	const headers = new Headers();

@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { routeAgentRequest } from "agents";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import {
@@ -15,6 +15,8 @@ import {
 } from "./lib/auth";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
+import type { Principal } from "./lib/access";
+import { gateAgentRequest, gateMcpRequest } from "./lib/gates";
 
 export { MailboxDO } from "./durableObject";
 export { EmailAgent } from "./agent";
@@ -35,18 +37,22 @@ const requestHandler = createRequestHandler(
 );
 
 // Main app that wraps the API and adds React Router fallback
-const app = new Hono<{ Bindings: Env }>();
+type AppEnv = { Bindings: Env; Variables: { principal: Principal } };
+const app = new Hono<AppEnv>();
 
 // Authentication middleware (production only). The actual verification lives
 // in ./lib/auth and dispatches on env.AUTH_MODE: "cf-access" (default, the
 // pre-existing Cloudflare Access JWT check) or "id.org.ai" (OIDC sessions for
 // browsers, bearer-token verification for API/MCP/agents).
 //
-// Authorization model note: any authenticated principal can access all
-// mailboxes in this app by design (single trust boundary).
+// Authorization: the verified principal is stored on the context and every
+// mailbox read path checks it (workers/lib/access.ts — owner, granted
+// members, MAILBOX_ADMINS allowlist; deny by default). The API routes use
+// requireMailbox; /mcp and /agents/* are gated below.
 app.use("*", async (c, next) => {
-	// Skip validation in development
+	// Skip validation in development (local dev acts as an admin)
 	if (import.meta.env.DEV) {
+		c.set("principal", { dev: true });
 		return next();
 	}
 
@@ -76,6 +82,7 @@ app.use("*", async (c, next) => {
 	if (!r.ok) {
 		return r.response;
 	}
+	c.set("principal", r.principal);
 	return next();
 });
 
@@ -88,19 +95,28 @@ app.get("/auth/logout", (c) => handleLogout(c, c.env));
 
 // MCP server endpoint — used by AI coding tools (ProtoAgent, Claude Code, Cursor, etc.)
 // Must be before API routes and React Router catch-all
+// Every MCP request goes through gateMcpRequest: it denies tools/call on a
+// mailbox the principal may not read, and stamps the verified principal on a
+// header the EmailMCP tools re-check (client-supplied copies are stripped).
 const mcpHandler = EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" });
-app.all("/mcp", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
-app.all("/mcp/*", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
+const serveMcp = async (c: Context<AppEnv>) => {
+	const gated = await gateMcpRequest(c.req.raw, c.env, c.get("principal"));
+	if (gated instanceof Response) return gated;
+	return mcpHandler.fetch(gated, c.env, c.executionCtx as ExecutionContext);
+};
+app.all("/mcp", (c) => serveMcp(c));
+app.all("/mcp/*", (c) => serveMcp(c));
 
 // Mount the API routes
 app.route("/", apiApp);
 
 // Agent WebSocket routing - must be before React Router catch-all
 app.all("/agents/*", async (c) => {
+	// Only the per-mailbox EmailAgent is reachable here, and only for a
+	// mailbox the principal may read (its chat history and tools are that
+	// mailbox's mail). Other agent namespaces (e.g. email-mcp) are not exposed.
+	const denied = await gateAgentRequest(c.req.raw, c.env, c.get("principal"));
+	if (denied) return denied;
 	const response = await routeAgentRequest(c.req.raw, c.env);
 	if (response) return response;
 	return c.text("Agent not found", 404);

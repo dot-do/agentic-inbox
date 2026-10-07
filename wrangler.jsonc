@@ -33,6 +33,10 @@
 		// Auth mode: "cf-access" (default) or "id.org.ai" (OIDC via id.org.ai).
 		// id.org.ai mode also requires secrets ID_ORG_AI_CLIENT_ID and SESSION_SECRET.
 		"AUTH_MODE": "id.org.ai",
+		// Per-mailbox access (workers/lib/access.ts): owner + granted members;
+		// admins come from the MAILBOX_ADMINS SECRET (emails or subs), not a var.
+		// Without it, mailboxes that have no ACL yet (everything created before
+		// per-mailbox access) are readable only by their address holder.
 		"ID_ORG_AI_ISSUER": "https://id.org.ai",
 		// Email cascade registry: send-as domain -> per-account relay base URL.
 		// Seeded from ~/projects/domains/data/email-zones.tsv. Domains absent

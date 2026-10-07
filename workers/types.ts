@@ -37,6 +37,14 @@ export interface Env extends Cloudflare.Env {
 	// wrangler.jsonc and email-sender.ts parseEmailRelays().
 	RELAY_SECRET?: string; // secret
 
+	// --- Per-mailbox authorization (workers/lib/access.ts) ---
+	// Admin allowlist: emails and/or id.org.ai subs, comma/space separated or a
+	// JSON array. Admins can read every mailbox; everyone else only mailboxes
+	// they own or were granted. Unset = no admins (deny by default). Set with
+	// `wrangler secret put MAILBOX_ADMINS` (kept out of wrangler.jsonc vars so
+	// identities are not committed to the repo).
+	MAILBOX_ADMINS?: string; // secret
+
 	// --- agents@ archive (workers/lib/archive.ts) ---
 	// ARCHIVE_ADDRESS ("agents@do.industries") and ARCHIVE_ENABLED (true) are
 	// wrangler vars, so they arrive via the generated Cloudflare.Env (wrangler

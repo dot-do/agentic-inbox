@@ -4,7 +4,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/durable-sqlite";
-import { eq, and, or, asc, desc, sql } from "drizzle-orm";
+import { eq, and, or, asc, desc, sql, isNull } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
@@ -132,7 +132,8 @@ export class MailboxDO extends DurableObject<Env> {
 
 		const offset = (page - 1) * limit;
 
-		const conditions: SQL[] = [];
+		// Soft-deleted rows are never returned (keep-everything, ADR-0005).
+		const conditions: SQL[] = [isNull(schema.emails.deleted_at)];
 		if (folder) {
 			conditions.push(
 				sql`${schema.emails.folder_id} = (SELECT id FROM folders WHERE name = ${folder} OR id = ${folder} LIMIT 1)`,
@@ -163,7 +164,7 @@ export class MailboxDO extends DurableObject<Env> {
 				snippet: sql<string>`SUBSTR(${schema.emails.body}, 1, 300)`,
 			})
 			.from(schema.emails)
-			.where(conditions.length > 0 ? and(...conditions) : undefined)
+			.where(and(...conditions))
 			.orderBy(orderDir)
 			.limit(limit)
 			.offset(offset)
@@ -181,7 +182,7 @@ export class MailboxDO extends DurableObject<Env> {
 	 */
 	async countEmails(options: { folder?: string; thread_id?: string } = {}) {
 		const { folder, thread_id } = options;
-		const conditions: string[] = [];
+		const conditions: string[] = ["deleted_at IS NULL"];
 		const params: (string | number)[] = [];
 
 		if (folder) {
@@ -196,8 +197,7 @@ export class MailboxDO extends DurableObject<Env> {
 			params.push(thread_id);
 		}
 
-		const where =
-			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+		const where = `WHERE ${conditions.join(" AND ")}`;
 		const row = [
 			...this.ctx.storage.sql.exec(
 				`SELECT COUNT(*) as total FROM emails ${where}`,
@@ -244,6 +244,7 @@ export class MailboxDO extends DurableObject<Env> {
 						COALESCE(in_reply_to, id) as draft_group_key
 					FROM emails
 					WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)
+						AND deleted_at IS NULL
 				),
 				draft_stats AS (
 					SELECT
@@ -297,6 +298,7 @@ export class MailboxDO extends DurableObject<Env> {
 					${NORMALIZED_SUBJECT_SQL} as normalized_subject
 				FROM emails
 				WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)
+					AND deleted_at IS NULL
 			),
 			thread_to_conversation AS (
 				SELECT
@@ -316,6 +318,7 @@ export class MailboxDO extends DurableObject<Env> {
 				FROM emails e
 				LEFT JOIN thread_to_conversation tc
 					ON COALESCE(e.thread_id, e.id) = tc.raw_thread_id
+				WHERE e.deleted_at IS NULL
 			),
 			conversation_stats AS (
 				SELECT
@@ -397,7 +400,8 @@ export class MailboxDO extends DurableObject<Env> {
 				...this.ctx.storage.sql.exec(
 					`SELECT COUNT(DISTINCT COALESCE(in_reply_to, id)) as total
 					 FROM emails
-					 WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)`,
+					 WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)
+					   AND deleted_at IS NULL`,
 					folder,
 				),
 			][0] as { total: number } | undefined;
@@ -414,6 +418,7 @@ export class MailboxDO extends DurableObject<Env> {
 					${NORMALIZED_SUBJECT_SQL} as normalized_subject
 					FROM emails
 					WHERE folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)
+						AND deleted_at IS NULL
 				),
 				thread_to_conversation AS (
 					SELECT
@@ -440,7 +445,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const email = this.db
 			.select()
 			.from(schema.emails)
-			.where(eq(schema.emails.id, id))
+			.where(and(eq(schema.emails.id, id), isNull(schema.emails.deleted_at)))
 			.get();
 
 		if (!email) return null;
@@ -467,7 +472,7 @@ export class MailboxDO extends DurableObject<Env> {
 	async getThreadEmails(threadId: string) {
 		const emailRows = [
 			...this.ctx.storage.sql.exec(
-				`SELECT * FROM emails WHERE thread_id = ?1 ORDER BY date ASC`,
+				`SELECT * FROM emails WHERE thread_id = ?1 AND deleted_at IS NULL ORDER BY date ASC`,
 				threadId,
 			),
 		] as any[];
@@ -520,7 +525,7 @@ export class MailboxDO extends DurableObject<Env> {
 		this.db
 			.update(schema.emails)
 			.set(data)
-			.where(eq(schema.emails.id, id))
+			.where(and(eq(schema.emails.id, id), isNull(schema.emails.deleted_at)))
 			.run();
 
 		return this.getEmail(id);
@@ -528,17 +533,23 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async markThreadRead(threadId: string) {
 		this.ctx.storage.sql.exec(
-			`UPDATE emails SET read = 1 WHERE thread_id = ? AND read = 0`,
+			`UPDATE emails SET read = 1 WHERE thread_id = ? AND read = 0 AND deleted_at IS NULL`,
 			threadId,
 		);
 		return { threadId, markedRead: true };
 	}
 
+	/**
+	 * Soft delete (keep-everything, ADR-0005): stamp deleted_at so every read
+	 * filters the email out. The row, its attachment rows, and the R2 blobs
+	 * are all kept. Returns null when the email is missing or already deleted,
+	 * otherwise the (retained) attachment list, as before.
+	 */
 	async deleteEmail(id: string) {
 		const email = this.db
 			.select({ id: schema.emails.id })
 			.from(schema.emails)
-			.where(eq(schema.emails.id, id))
+			.where(and(eq(schema.emails.id, id), isNull(schema.emails.deleted_at)))
 			.get();
 
 		if (!email) return null;
@@ -553,7 +564,8 @@ export class MailboxDO extends DurableObject<Env> {
 			.all();
 
 		this.db
-			.delete(schema.emails)
+			.update(schema.emails)
+			.set({ deleted_at: new Date().toISOString() })
 			.where(eq(schema.emails.id, id))
 			.run();
 
@@ -561,13 +573,14 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async getAttachment(id: string) {
-		return (
-			this.db
-				.select()
-				.from(schema.attachments)
-				.where(eq(schema.attachments.id, id))
-				.get() ?? null
-		);
+		// Attachments of a soft-deleted email are hidden with it.
+		const row = this.db
+			.select({ attachment: schema.attachments })
+			.from(schema.attachments)
+			.innerJoin(schema.emails, eq(schema.emails.id, schema.attachments.email_id))
+			.where(and(eq(schema.attachments.id, id), isNull(schema.emails.deleted_at)))
+			.get();
+		return row?.attachment ?? null;
 	}
 
 	// ── Folders (Drizzle) ──────────────────────────────────────────
@@ -580,13 +593,40 @@ export class MailboxDO extends DurableObject<Env> {
 				unreadCount: sql<number>`COALESCE(SUM(CASE WHEN ${schema.emails.read} = 0 THEN 1 ELSE 0 END), 0)`.mapWith(Number),
 			})
 			.from(schema.folders)
-			.leftJoin(schema.emails, eq(schema.emails.folder_id, schema.folders.id))
+			.leftJoin(
+				schema.emails,
+				and(eq(schema.emails.folder_id, schema.folders.id), isNull(schema.emails.deleted_at)),
+			)
+			.where(isNull(schema.folders.deleted_at))
 			.groupBy(schema.folders.id, schema.folders.name)
 			.all();
 		return result;
 	}
 
 	async createFolder(id: string, name: string, is_deletable: number = 1) {
+		// A soft-deleted folder with this id is revived rather than duplicated
+		// (its old emails stay soft-deleted).
+		const existing = this.db
+			.select({ id: schema.folders.id, deleted_at: schema.folders.deleted_at })
+			.from(schema.folders)
+			.where(eq(schema.folders.id, id))
+			.get();
+		if (existing?.deleted_at) {
+			try {
+				const revived = this.db
+					.update(schema.folders)
+					.set({ name, deleted_at: null })
+					.where(eq(schema.folders.id, id))
+					.returning({ id: schema.folders.id, name: schema.folders.name })
+					.get();
+				return { ...revived, unreadCount: 0 };
+			} catch (e: unknown) {
+				if (e instanceof Error && e.message.includes("UNIQUE constraint failed")) {
+					return null;
+				}
+				throw e;
+			}
+		}
 		try {
 			const result = this.db
 				.insert(schema.folders)
@@ -606,27 +646,42 @@ export class MailboxDO extends DurableObject<Env> {
 		const result = this.db
 			.update(schema.folders)
 			.set({ name })
-			.where(eq(schema.folders.id, id))
+			.where(and(eq(schema.folders.id, id), isNull(schema.folders.deleted_at)))
 			.returning({ id: schema.folders.id, name: schema.folders.name })
 			.get();
 		return result;
 	}
 
+	/**
+	 * Soft delete a folder (keep-everything, ADR-0005). The old behaviour was
+	 * a hard DELETE whose ON DELETE CASCADE wiped every email in the folder
+	 * (and their attachments). Now the folder and the emails in it get the
+	 * same deleted_at stamp and vanish from reads; nothing is removed.
+	 */
 	async deleteFolder(id: string) {
 		const folder = this.db
 			.select({ is_deletable: schema.folders.is_deletable })
 			.from(schema.folders)
-			.where(eq(schema.folders.id, id))
+			.where(and(eq(schema.folders.id, id), isNull(schema.folders.deleted_at)))
 			.get();
 
 		if (!folder || folder.is_deletable === 0) {
 			return false;
 		}
 
-		this.db
-			.delete(schema.folders)
-			.where(eq(schema.folders.id, id))
-			.run();
+		const now = new Date().toISOString();
+		this.ctx.storage.transactionSync(() => {
+			this.db
+				.update(schema.emails)
+				.set({ deleted_at: now })
+				.where(and(eq(schema.emails.folder_id, id), isNull(schema.emails.deleted_at)))
+				.run();
+			this.db
+				.update(schema.folders)
+				.set({ deleted_at: now })
+				.where(eq(schema.folders.id, id))
+				.run();
+		});
 
 		return true;
 	}
@@ -635,7 +690,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const folder = this.db
 			.select({ id: schema.folders.id })
 			.from(schema.folders)
-			.where(eq(schema.folders.id, folderId))
+			.where(and(eq(schema.folders.id, folderId), isNull(schema.folders.deleted_at)))
 			.get();
 
 		if (!folder) return false;
@@ -643,7 +698,7 @@ export class MailboxDO extends DurableObject<Env> {
 		this.db
 			.update(schema.emails)
 			.set({ folder_id: folderId })
-			.where(eq(schema.emails.id, id))
+			.where(and(eq(schema.emails.id, id), isNull(schema.emails.deleted_at)))
 			.run();
 
 		return true;
@@ -661,7 +716,8 @@ export class MailboxDO extends DurableObject<Env> {
 	): { conditions: string[]; params: (string | number)[] } {
 		const { query, folder, from, to, subject, date_start, date_end, is_read, is_starred, has_attachment } = options;
 		const prefix = tableAlias ? `${tableAlias}.` : "";
-		const conditions: string[] = [];
+		// Soft-deleted rows never match a search.
+		const conditions: string[] = [`${prefix}deleted_at IS NULL`];
 		const params: (string | number)[] = [];
 		let paramIdx = 0;
 
@@ -699,7 +755,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const limit = Math.min(Math.max(rawLimit, 1), 100);
 		const { conditions, params } = this.#buildSearchConditions(options, "e");
 
-		const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+		const where = `WHERE ${conditions.join(" AND ")}`;
 		const offset = (page - 1) * limit;
 
 		const query = `
@@ -728,7 +784,7 @@ export class MailboxDO extends DurableObject<Env> {
 	async countSearchResults(options: SearchFilterOptions) {
 		const { conditions, params } = this.#buildSearchConditions(options);
 
-		const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+		const where = `WHERE ${conditions.join(" AND ")}`;
 		const query = `SELECT COUNT(*) as total FROM emails ${where}`;
 
 		const row = [...this.ctx.storage.sql.exec(query, ...params)][0] as
@@ -754,6 +810,7 @@ export class MailboxDO extends DurableObject<Env> {
 			 FROM emails
 			 WHERE thread_id IS NOT NULL
 			   AND thread_id != id
+			   AND deleted_at IS NULL
 			   AND date >= datetime('now', '-7 days')
 			 GROUP BY thread_id
 			 ORDER BY MAX(date) DESC

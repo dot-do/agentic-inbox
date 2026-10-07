@@ -22,9 +22,9 @@
 //           and must come back active:true. This covers device_code and
 //           client_credentials agents.
 //
-// Authorization stays intentionally coarse in BOTH modes: any authenticated
-// principal can access all mailboxes (single trust boundary). Do not add
-// per-mailbox authz here.
+// This module only AUTHENTICATES: it resolves who the caller is (a Principal:
+// verified email and/or IdP sub). Per-mailbox AUTHORIZATION — owner, granted
+// members, admin allowlist, deny by default — lives in workers/lib/access.ts.
 //
 // NOTE: the import.meta.env.DEV bypass stays in the middleware in
 // workers/app.ts — authenticate() assumes it is only called in production.
@@ -37,16 +37,35 @@ import {
 	SignJWT,
 } from "jose";
 import type { Env } from "../types";
+import type { Principal } from "./access";
 
-// The Hono context shape this app uses everywhere.
-type AppContext = Context<{ Bindings: Env }>;
+// The Hono context shape of the outer app (workers/app.ts), which carries the
+// authenticated principal as a context variable.
+type AppContext = Context<{ Bindings: Env; Variables: { principal: Principal } }>;
 
 /**
  * Result of an authentication attempt. When `ok` is false, `response` is
  * exactly what the middleware should return to the client: a 403, a 500
  * (misconfiguration, fail closed), or a 302 into the OIDC login flow.
  */
-export type AuthResult = { ok: true } | { ok: false; response: Response };
+export type AuthResult =
+	| { ok: true; principal: Principal }
+	| { ok: false; response: Response };
+
+/**
+ * Build a Principal from verified token/claim fields. The email is dropped
+ * when the IdP explicitly marks it unverified, so it can never be used to
+ * match a mailbox address or ACL entry. A principal with neither email nor
+ * sub cannot be authorized for anything (access.ts denies by default).
+ */
+export function principalFromClaims(claims: Record<string, unknown>): Principal {
+	const p: Principal = {};
+	if (typeof claims.sub === "string" && claims.sub) p.sub = claims.sub;
+	if (typeof claims.email === "string" && claims.email && claims.email_verified !== false) {
+		p.email = claims.email.toLowerCase();
+	}
+	return p;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -157,17 +176,16 @@ export async function cfAccessVerify(
 	try {
 		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
 		const JWKS = createRemoteJWKSet(certsUrl);
-		await jwtVerify(token, JWKS, {
+		const { payload } = await jwtVerify(token, JWKS, {
 			issuer,
 			audience: POLICY_AUD,
 		});
+		// Access identities are verified by Access itself; per-mailbox
+		// authorization happens in workers/lib/access.ts.
+		return { ok: true, principal: principalFromClaims(payload) };
 	} catch {
 		return { ok: false, response: c.text("Invalid or expired Access token", 403) };
 	}
-
-	// Authorization model note: once a teammate passes the shared Cloudflare
-	// Access policy, they can access all mailboxes in this app by design.
-	return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -256,8 +274,8 @@ async function verifyBearer(
 	if (isJwtShaped(token)) {
 		try {
 			const jwks = getRemoteJwks(`${issuer}/.well-known/jwks.json`);
-			await jwtVerify(token, jwks, { issuer });
-			return { ok: true };
+			const { payload } = await jwtVerify(token, jwks, { issuer });
+			return { ok: true, principal: principalFromClaims(payload) };
 		} catch {
 			// Structurally a JWT but failed verification (bad signature, expired,
 			// wrong issuer). Do NOT fall back to introspection for these — a JWT
@@ -293,9 +311,9 @@ async function verifyBearer(
 			body: new URLSearchParams({ token }).toString(),
 		});
 		if (res.ok) {
-			const body = (await res.json()) as { active?: boolean };
+			const body = (await res.json()) as Record<string, unknown> & { active?: boolean };
 			if (body.active === true) {
-				return { ok: true };
+				return { ok: true, principal: principalFromClaims(body) };
 			}
 		}
 	} catch {
@@ -317,11 +335,11 @@ async function verifyBrowser(c: AppContext, env: Env): Promise<AuthResult> {
 	const session = cookies[SESSION_COOKIE];
 	if (session) {
 		try {
-			await jwtVerify(session, sessionKey(env), {
+			const { payload } = await jwtVerify(session, sessionKey(env), {
 				issuer: SELF_JWT_ISSUER,
 				audience: SESSION_JWT_AUDIENCE,
 			});
-			return { ok: true };
+			return { ok: true, principal: principalFromClaims(payload) };
 		} catch {
 			// Expired/invalid session — fall through to re-login (or 403).
 		}
