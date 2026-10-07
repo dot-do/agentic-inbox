@@ -9,7 +9,8 @@ import { z } from "zod";
 import { sendVia } from "./email-sender";
 import { archiveInboundCopy } from "./lib/archive";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
-import { verifyRelayRequest, RELAY_SIG_HEADER, RELAY_TS_HEADER } from "./lib/relay-hmac";
+import { RELAY_SIG_HEADER, RELAY_TS_HEADER } from "./lib/relay-hmac";
+import { inScope, verifyRelayCaller } from "./lib/relay-auth";
 import {
 	validateSender,
 	SenderValidationError,
@@ -30,6 +31,7 @@ import {
 	getMailboxAcl,
 	isAdmin,
 	isMailboxDeleted,
+	isOwnVerifiedAddress,
 	mailboxTombstoneKey,
 	primaryId,
 	putMailboxAcl,
@@ -47,6 +49,9 @@ const MembersBody = z.object({
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
 	name: z.string().min(1),
+	// Admin only: the principal (email or id.org.ai sub) who will own the new
+	// mailbox — how agent mailboxes are provisioned for an agent identity.
+	owner: z.string().min(1).optional(),
 	settings: z.record(z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
 });
 
@@ -134,8 +139,25 @@ app.get("/api/v1/mailboxes", async (c) => {
 });
 
 app.post("/api/v1/mailboxes", async (c) => {
-	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
-	const email = rawEmail.toLowerCase();
+	const parsedBody = CreateMailboxBody.safeParse(await c.req.json().catch(() => null));
+	if (!parsedBody.success) return c.json({ error: "Invalid mailbox request", issues: parsedBody.error.issues }, 400);
+	const { name, settings, email: rawEmail, owner: requestedOwner } = parsedBody.data;
+	const email = rawEmail.trim().toLowerCase();
+	// Who may create (and so own) a mailbox — no claiming of arbitrary
+	// addresses:
+	//  - an admin, for any address, optionally on behalf of `owner` (agent
+	//    mailboxes are provisioned this way, or granted by an existing owner
+	//    via PUT /mailboxes/:id/members);
+	//  - anyone else only for their OWN verified address, matched exactly
+	//    after normalization: no plus/dot aliases, no case or Unicode tricks.
+	const principal = c.get("principal");
+	const admin = isAdmin(c.env, principal);
+	if (!admin) {
+		if (requestedOwner !== undefined) return c.json({ error: "Only admins can create a mailbox for someone else" }, 403);
+		if (!isOwnVerifiedAddress(principal, email)) {
+			return c.json({ error: "You can only create a mailbox for your own verified email address" }, 403);
+		}
+	}
 	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
 	if (allowedAddresses.length > 0 && !allowedAddresses.map((a) => a.toLowerCase()).includes(email)) {
 		return c.json({ error: "Mailbox creation is restricted to configured EMAIL_ADDRESSES" }, 403);
@@ -145,9 +167,8 @@ app.post("/api/v1/mailboxes", async (c) => {
 	// Soft-deleted mailboxes keep their key forever (keep-everything), so the
 	// address stays taken; an admin can restore it instead.
 	if (await isMailboxDeleted(c.env.BUCKET, email)) return c.json({ error: "Mailbox already exists" }, 409);
-	const principal = c.get("principal");
-	const owner = principal ? primaryId(principal) : undefined;
-	if (!owner && !isAdmin(c.env, principal)) return c.json({ error: "Forbidden" }, 403);
+	const owner = requestedOwner?.trim().toLowerCase() || (principal ? primaryId(principal) : undefined);
+	if (!owner) return c.json({ error: "Forbidden" }, 403);
 	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
@@ -409,8 +430,10 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 app.post("/api/v1/ingest", async (c) => {
 	const rawBody = await c.req.text();
 
-	const verified = await verifyRelayRequest(
-		c.env.RELAY_SECRET ?? "",
+	// Which relay is calling is decided by which key verifies; that relay may
+	// only deliver to the domains it serves (workers/lib/relay-auth.ts).
+	const verified = await verifyRelayCaller(
+		c.env,
 		rawBody,
 		c.req.header(RELAY_SIG_HEADER),
 		c.req.header(RELAY_TS_HEADER),
@@ -430,41 +453,21 @@ app.post("/api/v1/ingest", async (c) => {
 		return c.json({ error: "bad_request", reason: "to[] and from are required" }, 400);
 	}
 
+	// Scope: only recipients on this relay's own domains can receive this
+	// message. A relay can never deliver into a local (.do) mailbox or into
+	// another relay's domains.
+	const scopedTo = msg.to.filter((a) => typeof a === "string" && inScope(verified.credential, a));
+	if (scopedTo.length === 0) {
+		console.warn(`/api/v1/ingest rejected: no recipient in scope for relay ${verified.credential.relay}`);
+		return c.json({ error: "forbidden", reason: "recipient domain not served by this relay" }, 403);
+	}
+	msg = { ...msg, to: scopedTo };
+
 	// storeInboundEmail returns "ignored" (no matching/existing mailbox) or
 	// "stored" — a clean 200 either way, never a 500 (which would make CF Email
 	// Routing retry on the relay side for an unknown recipient).
 	const result = await storeInboundEmail(msg, c.env, c.executionCtx as ExecutionContext);
 	return c.json({ status: result });
-});
-
-// POST /api/v1/_admin/read — HMAC-authed (RELAY_SECRET) operator read of recent
-// mail from a mailbox, or a listing of mailboxes when { list: true }. Bypasses
-// the browser/OIDC session (server-to-server only). Body: {mailbox, limit?} | {list:true}.
-app.post("/api/v1/_admin/read", async (c) => {
-	const rawBody = await c.req.text();
-	const verified = await verifyRelayRequest(
-		c.env.RELAY_SECRET ?? "",
-		rawBody,
-		c.req.header(RELAY_SIG_HEADER),
-		c.req.header(RELAY_TS_HEADER),
-	);
-	if (!verified.ok) return c.json({ error: "unauthorized", reason: verified.reason }, 401);
-
-	let req: { mailbox?: string; limit?: number; list?: boolean; emailId?: string };
-	try { req = JSON.parse(rawBody); } catch { return c.json({ error: "bad_request" }, 400); }
-
-	if (req.list) {
-		const boxes = await listMailboxes(c.env.BUCKET);
-		return c.json({ mailboxes: boxes.map((m) => m.id) });
-	}
-	if (!req.mailbox) return c.json({ error: "bad_request", reason: "mailbox required" }, 400);
-	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(req.mailbox.toLowerCase()));
-	if (req.emailId) {
-		const full = await stub.getEmail(req.emailId); // includes full body
-		return c.json({ mailbox: req.mailbox, email: full });
-	}
-	const emails = await stub.getEmails({ folder: Folders.INBOX, limit: req.limit ?? 20 });
-	return c.json({ mailbox: req.mailbox, count: emails.length, emails });
 });
 
 // -- Receive inbound email ------------------------------------------

@@ -35,7 +35,10 @@ export interface Env extends Cloudflare.Env {
 	// EMAIL_RELAYS (registry-seeded JSON map of send-as domain -> relay base
 	// URL) is a wrangler var, so it arrives via Cloudflare.Env — see
 	// wrangler.jsonc and email-sender.ts parseEmailRelays().
-	RELAY_SECRET?: string; // secret
+	RELAY_SECRET?: string; // secret (legacy shared key; see workers/lib/relay-auth.ts)
+	// Per-relay keys, JSON {"<relay base URL>": "<secret>"}. Each key is valid
+	// only for the EMAIL_RELAYS domains that point at that relay.
+	RELAY_KEYS?: string; // secret
 
 	// --- Per-mailbox authorization (workers/lib/access.ts) ---
 	// Admin allowlist: emails and/or id.org.ai subs, comma/space separated or a
