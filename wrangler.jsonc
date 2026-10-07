@@ -56,7 +56,15 @@
 		// DO index is the scale path (see workers/lib/archive.ts header).
 		"ARCHIVE_ADDRESS": "agents@do.industries",
 		"LEDGER_ADDRESS": "ledger@emails.do",
-		"ARCHIVE_ENABLED": true
+		"ARCHIVE_ENABLED": true,
+		// Retiring onto api.sb's email primitive (StartupsStudio/sb#337). Kept,
+		// never deleted. Set MAIL_BACKEND to "api.sb" (and the API_SB_TOKEN
+		// secret) only after the import's counts match; until then "" keeps
+		// every route on this store.
+		"RETIRING": "api.sb (StartupsStudio/sb#337): kept read-only, never deleted",
+		"MAIL_BACKEND": "",
+		"API_SB_URL": "https://api.sb",
+		"API_SB_STARTUP": ""
 	},
 	"send_email": [
 		{
