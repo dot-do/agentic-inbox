@@ -12,6 +12,7 @@ import {
 	handleLogin,
 	handleLogout,
 	isPublicAuthPath,
+	redirectToCanonicalOrigin,
 } from "./lib/auth";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
@@ -54,6 +55,19 @@ app.use("*", async (c, next) => {
 	if (import.meta.env.DEV) {
 		c.set("principal", { dev: true });
 		return next();
+	}
+
+	// The server-to-server HMAC endpoints below carry no cookies and no
+	// redirect_uri, so they are left on whatever origin the caller used.
+	const serverToServer = c.req.path === "/api/v1/ingest" || c.req.path === "/api/v1/_admin/read";
+
+	// Move browsers to the canonical origin (https, no trailing-dot host)
+	// before anything else: a sign-in started on http://emails.do sends an
+	// unregistered redirect_uri to id.org.ai (400 "Invalid redirect_uri") and
+	// cannot keep its Secure cookies. See canonicalOrigin in ./lib/auth.
+	if (!serverToServer) {
+		const upgrade = redirectToCanonicalOrigin(c.req.raw);
+		if (upgrade) return upgrade;
 	}
 
 	// The login-bootstrap routes (/auth/login, /auth/callback, /auth/logout)
