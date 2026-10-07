@@ -53,18 +53,56 @@ export type AuthResult =
 	| { ok: false; response: Response };
 
 /**
- * Build a Principal from verified token/claim fields. The email is dropped
- * when the IdP explicitly marks it unverified, so it can never be used to
- * match a mailbox address or ACL entry. A principal with neither email nor
- * sub cannot be authorized for anything (access.ts denies by default).
+ * Build a Principal from verified token/claim fields.
+ *
+ * The email is kept ONLY when the claims positively assert it is verified
+ * (`email_verified: true`). A missing or false `email_verified` means NOT
+ * verified, and the email is dropped, so it can never match a mailbox
+ * address or an ACL entry. id.org.ai id_tokens always carry an explicit
+ * `email_verified` (its toIdentityInfo defaults it to false).
+ *
+ * `trustEmail` is only for Cloudflare Access JWTs: Access asserts the email
+ * itself after its own IdP login and never emits `email_verified`.
+ *
+ * A principal with neither email nor sub cannot be authorized for anything
+ * (access.ts denies by default).
  */
-export function principalFromClaims(claims: Record<string, unknown>): Principal {
+export function principalFromClaims(
+	claims: Record<string, unknown>,
+	opts: { trustEmail?: boolean } = {},
+): Principal {
 	const p: Principal = {};
 	if (typeof claims.sub === "string" && claims.sub) p.sub = claims.sub;
-	if (typeof claims.email === "string" && claims.email && claims.email_verified !== false) {
-		p.email = claims.email.toLowerCase();
+	const verified = opts.trustEmail === true || claims.email_verified === true;
+	if (typeof claims.email === "string" && claims.email && verified) {
+		p.email = claims.email.trim().toLowerCase();
 	}
 	return p;
+}
+
+/**
+ * Audiences a bearer JWT must carry (at least one) to be accepted here:
+ * ID_ORG_AI_AUDIENCE, comma/space separated or a JSON array — for emails.do
+ * the RFC 8707 resource URLs "https://emails.do" and "https://emails.do/mcp"
+ * that id.org.ai binds into a token's audience. Unset or empty means no JWT
+ * bearer is accepted (fail closed).
+ */
+export function expectedAudiences(env: Env): string[] {
+	const raw = (env as unknown as { ID_ORG_AI_AUDIENCE?: unknown }).ID_ORG_AI_AUDIENCE;
+	let items: unknown[] = [];
+	if (Array.isArray(raw)) items = raw;
+	else if (typeof raw === "string" && raw.trim()) {
+		const s = raw.trim();
+		if (s.startsWith("[")) {
+			try {
+				const parsed = JSON.parse(s);
+				if (Array.isArray(parsed)) items = parsed;
+			} catch {
+				items = [];
+			}
+		} else items = s.split(/[\s,]+/);
+	}
+	return items.filter((x): x is string => typeof x === "string" && x.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +220,7 @@ export async function cfAccessVerify(
 		});
 		// Access identities are verified by Access itself; per-mailbox
 		// authorization happens in workers/lib/access.ts.
-		return { ok: true, principal: principalFromClaims(payload) };
+		return { ok: true, principal: principalFromClaims(payload, { trustEmail: true }) };
 	} catch {
 		return { ok: false, response: c.text("Invalid or expired Access token", 403) };
 	}
@@ -258,11 +296,18 @@ function isJwtShaped(token: string): boolean {
 /**
  * (b) API/MCP/agent principals: Authorization: Bearer <token>.
  *
- * JWT access tokens are verified locally against id.org.ai's JWKS
- * (issuer only — id.org.ai access-token audiences are client-specific and
- * not part of this contract). Opaque tokens fall back to RFC 7662 token
- * introspection with client_secret_basic, requiring `active: true`. That
- * fallback is what lets device_code and client_credentials agents in.
+ * JWT bearers are verified locally against id.org.ai's JWKS for issuer AND
+ * audience: `aud` must include one of ID_ORG_AI_AUDIENCE (the emails.do
+ * resource URLs). That rejects id.org.ai session JWTs (no `aud`) and
+ * id_tokens minted for other clients (`aud` = that client) — tokens meant
+ * for some other relying party can't be replayed here.
+ *
+ * Opaque tokens (id.org.ai `at_…` access tokens) fall back to RFC 7662 token
+ * introspection with client_secret_basic, requiring `active: true` and an
+ * access token (refresh tokens introspect as active too and are refused).
+ * That fallback is what lets device_code and client_credentials agents in.
+ * id.org.ai's introspection response carries no audience/resource, so those
+ * tokens are bound by client authentication only.
  */
 async function verifyBearer(
 	c: AppContext,
@@ -272,9 +317,13 @@ async function verifyBearer(
 	const issuer = getIssuer(env);
 
 	if (isJwtShaped(token)) {
+		const audience = expectedAudiences(env);
+		if (audience.length === 0) {
+			return { ok: false, response: c.text("JWT bearer tokens are not accepted: ID_ORG_AI_AUDIENCE is not configured", 403) };
+		}
 		try {
 			const jwks = getRemoteJwks(`${issuer}/.well-known/jwks.json`);
-			const { payload } = await jwtVerify(token, jwks, { issuer });
+			const { payload } = await jwtVerify(token, jwks, { issuer, audience });
 			return { ok: true, principal: principalFromClaims(payload) };
 		} catch {
 			// Structurally a JWT but failed verification (bad signature, expired,
@@ -312,7 +361,9 @@ async function verifyBearer(
 		});
 		if (res.ok) {
 			const body = (await res.json()) as Record<string, unknown> & { active?: boolean };
-			if (body.active === true) {
+			// Refresh tokens also introspect as active; only access tokens may
+			// call the API.
+			if (body.active === true && body.token_type !== "refresh_token") {
 				return { ok: true, principal: principalFromClaims(body) };
 			}
 		}

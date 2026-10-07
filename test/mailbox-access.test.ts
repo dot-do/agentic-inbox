@@ -211,15 +211,15 @@ describe("mailbox read access (REST API)", () => {
 		expect(await ids(ADMIN)).toEqual(["alice@x.com", "bob@x.com", "legacy@x.com", "shared@x.com"]);
 	});
 
-	it("creating a mailbox makes the creator its only owner", async () => {
-		const res = await t.call(ALICE, "/api/v1/mailboxes", {
+	it("an admin-created mailbox for an agent is owned by that agent only", async () => {
+		const res = await t.call(ADMIN, "/api/v1/mailboxes", {
 			method: "POST",
-			body: JSON.stringify({ email: "new@x.com", name: "New" }),
+			body: JSON.stringify({ email: "bot@x.com", name: "Bot", owner: "sub-bot" }),
 		});
 		expect(res.status).toBe(201);
-		expect(JSON.parse(t.bucket.store.get("mailbox-acl/new@x.com.json")!)).toEqual({ owner: "alice@x.com", members: [] });
-		expect((await t.call(BOB, "/api/v1/mailboxes/new@x.com/emails/e1")).status).toBe(404);
-		expect((await t.call(ALICE, "/api/v1/mailboxes/new@x.com/emails/e1")).status).toBe(200);
+		expect(JSON.parse(t.bucket.store.get("mailbox-acl/bot@x.com.json")!)).toEqual({ owner: "sub-bot", members: [] });
+		expect((await t.call({ sub: "sub-bot" }, "/api/v1/mailboxes/bot@x.com/emails/e1")).status).toBe(200);
+		expect((await t.call(ALICE, "/api/v1/mailboxes/bot@x.com/emails/e1")).status).toBe(404);
 	});
 });
 
@@ -341,6 +341,7 @@ describe("agent gate (/agents/*)", () => {
 describe("principal extraction", () => {
 	it("drops an email the IdP marks unverified", () => {
 		expect(principalFromClaims({ sub: "s", email: "Bob@X.com", email_verified: false })).toEqual({ sub: "s" });
+		expect(principalFromClaims({ sub: "s", email: "Bob@X.com" })).toEqual({ sub: "s" });
 		expect(principalFromClaims({ sub: "s", email: "Bob@X.com", email_verified: true })).toEqual({ sub: "s", email: "bob@x.com" });
 	});
 });

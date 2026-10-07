@@ -12,6 +12,7 @@
 
 import type { Env } from "./types";
 import { signRelayBody } from "./lib/relay-hmac";
+import { signingSecretFor } from "./lib/relay-auth";
 import { archiveOutboundCopy } from "./lib/archive";
 
 export interface SendEmailParams {
@@ -214,10 +215,12 @@ export async function sendVia(
 		return result;
 	}
 
-	// REMOTE domain — delegate to the account's relay over HMAC-signed HTTPS.
-	if (!env.RELAY_SECRET) {
+	// REMOTE domain — delegate to the account's relay over HMAC-signed HTTPS,
+	// signed with that relay's own key (RELAY_KEYS) or the legacy RELAY_SECRET.
+	const relaySecret = signingSecretFor(env, relayBase);
+	if (!relaySecret) {
 		throw new Error(
-			`Cannot delegate send for remote domain to ${relayBase}: RELAY_SECRET is not configured`,
+			`Cannot delegate send for remote domain to ${relayBase}: no RELAY_KEYS entry and RELAY_SECRET is not configured`,
 		);
 	}
 
@@ -240,7 +243,7 @@ export async function sendVia(
 	}
 
 	const rawBody = JSON.stringify(payload);
-	const sigHeaders = await signRelayBody(env.RELAY_SECRET, rawBody);
+	const sigHeaders = await signRelayBody(relaySecret, rawBody);
 
 	const res = await fetch(`${relayBase}/send`, {
 		method: "POST",

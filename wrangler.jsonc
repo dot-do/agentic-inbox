@@ -38,6 +38,10 @@
 		// Without it, mailboxes that have no ACL yet (everything created before
 		// per-mailbox access) are readable only by their address holder.
 		"ID_ORG_AI_ISSUER": "https://id.org.ai",
+		// Bearer JWTs must carry one of these audiences (RFC 8707 resource
+		// indicators id.org.ai binds into `aud`). Session JWTs (no aud) and
+		// id_tokens minted for other clients are rejected.
+		"ID_ORG_AI_AUDIENCE": "https://emails.do,https://emails.do/mcp",
 		// Email cascade registry: send-as domain -> per-account relay base URL.
 		// Seeded from ~/projects/domains/data/email-zones.tsv. Domains absent
 		// here are LOCAL (.do account) and sent directly via env.EMAIL.

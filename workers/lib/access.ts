@@ -114,6 +114,19 @@ export function isAddressHolder(p: Principal | undefined | null, mailboxId: stri
 	return !!p?.email && norm(p.email) === norm(mailboxId);
 }
 
+/**
+ * True only when `address` is exactly the principal's own verified email:
+ * plain ASCII, compared after trim + lower-case, nothing else. Plus/dot
+ * aliases ("me+bot@x", "m.e@x") are different addresses and never match.
+ * Principal.email is only ever set for verified emails (workers/lib/auth.ts).
+ */
+export function isOwnVerifiedAddress(p: Principal | undefined | null, address: string): boolean {
+	if (!p?.email) return false;
+	const a = address.trim();
+	if (!/^[\x21-\x7e]+$/.test(a)) return false;
+	return norm(a) === norm(p.email);
+}
+
 export async function getMailboxAcl(bucket: R2Bucket, mailboxId: string): Promise<MailboxAcl | null> {
 	const obj = await bucket.get(aclKey(mailboxId));
 	if (!obj) return null;

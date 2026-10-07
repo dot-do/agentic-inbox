@@ -71,13 +71,6 @@ app.use("*", async (c, next) => {
 		return next();
 	}
 
-	// Server-to-server admin read (POST /api/v1/_admin/read), HMAC-authed by its
-	// own handler over the raw body — same RELAY_SECRET trust as ingest. Lets an
-	// operator pull recent mail out of a mailbox without the browser/OIDC session.
-	if (c.req.path === "/api/v1/_admin/read") {
-		return next();
-	}
-
 	const r = await authenticate(c, c.env);
 	if (!r.ok) {
 		return r.response;
