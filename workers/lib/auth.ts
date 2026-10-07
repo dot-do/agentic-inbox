@@ -109,6 +109,59 @@ export function isPublicAuthPath(pathname: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical origin
+// ---------------------------------------------------------------------------
+//
+// The custom domain also answers plain http:// (the zone does not force
+// HTTPS) and the trailing-dot spelling of the host (`emails.do.`). Neither
+// can complete a sign-in:
+//
+//   - redirect_uri is derived from the request origin, and id.org.ai only
+//     has https://<host>/auth/callback registered, so it answers
+//     400 {"error":"invalid_request","error_description":"Invalid redirect_uri"}
+//     and the browser is stranded on a JSON error page;
+//   - the state and session cookies are `Secure` and host-only, so they are
+//     never stored over http, and a cookie set on `emails.do.` is never sent
+//     to `emails.do`.
+//
+// So every browser request is first moved to the canonical origin
+// (https, no trailing dot), and redirect_uri is always built from it.
+
+/**
+ * The canonical form of `url`'s origin: https, hostname without a trailing
+ * dot. Loopback hosts keep their scheme and port (local `wrangler dev`).
+ */
+export function canonicalOrigin(url: URL): string {
+	const host = url.hostname.replace(/\.+$/, "").toLowerCase();
+	if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") {
+		return url.origin;
+	}
+	return `https://${host}`;
+}
+
+/**
+ * Where a request on a non-canonical origin should go instead, or null when
+ * it is already canonical. The path and query are kept; the method is kept
+ * too (the caller answers 308).
+ */
+export function canonicalRedirectTarget(url: URL): string | null {
+	const origin = canonicalOrigin(url);
+	if (origin === url.origin) return null;
+	return `${origin}${url.pathname}${url.search}`;
+}
+
+/**
+ * 308 to the canonical origin when `request` arrived on another spelling of
+ * it (http://, trailing-dot host); null when it is already canonical. 308
+ * keeps the method and body, so a non-GET caller is not silently downgraded.
+ */
+export function redirectToCanonicalOrigin(request: Request): Response | null {
+	const target = canonicalRedirectTarget(new URL(request.url));
+	if (!target) return null;
+	return new Response(null, { status: 308, headers: { location: target } });
+}
+
+// ---------------------------------------------------------------------------
 // Entry point: dispatch on AUTH_MODE
 // ---------------------------------------------------------------------------
 
@@ -419,9 +472,9 @@ async function buildAuthorizeRedirect(
 	return new Response(null, { status: 302, headers });
 }
 
-/** redirect_uri is always <this origin>/auth/callback. */
+/** redirect_uri is always <canonical origin>/auth/callback (see canonicalOrigin). */
 function getRedirectUri(c: AppContext): string {
-	return `${new URL(c.req.url).origin}/auth/callback`;
+	return `${canonicalOrigin(new URL(c.req.url))}/auth/callback`;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +530,7 @@ export async function handleAuthCallback(
 	// The IdP reports user-visible failures (access_denied, ...) via ?error=.
 	const idpError = url.searchParams.get("error");
 	if (idpError) {
+		console.error("auth.callback.idp_error", idpError, url.searchParams.get("error_description") ?? "");
 		return c.text(`Login failed: ${idpError}`, 403);
 	}
 
@@ -529,14 +583,20 @@ export async function handleAuthCallback(
 			body: tokenParams.toString(),
 		});
 		if (!tokenRes.ok) {
+			// Log the IdP's OAuth error (never the code or tokens) so
+			// `wrangler tail` shows why a sign-in failed.
+			const detail = (await tokenRes.text().catch(() => "")).slice(0, 300);
+			console.error("auth.callback.token_exchange_failed", tokenRes.status, detail);
 			return c.text("Token exchange failed. Please try signing in again.", 403);
 		}
 		const tokens = (await tokenRes.json()) as { id_token?: string };
 		if (!tokens.id_token) {
+			console.error("auth.callback.no_id_token");
 			return c.text("Token response did not include an id_token.", 403);
 		}
 		idToken = tokens.id_token;
-	} catch {
+	} catch (err) {
+		console.error("auth.callback.token_exchange_error", String(err));
 		return c.text("Token exchange failed. Please try signing in again.", 502);
 	}
 
@@ -556,7 +616,8 @@ export async function handleAuthCallback(
 			audience: env.ID_ORG_AI_CLIENT_ID,
 		});
 		claims = payload;
-	} catch {
+	} catch (err) {
+		console.error("auth.callback.id_token_invalid", String(err));
 		return c.text("Invalid id_token. Please try signing in again.", 403);
 	}
 
