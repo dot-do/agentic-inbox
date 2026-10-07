@@ -33,10 +33,12 @@
 		// Auth mode: "cf-access" (default) or "id.org.ai" (OIDC via id.org.ai).
 		// id.org.ai mode also requires secrets ID_ORG_AI_CLIENT_ID and SESSION_SECRET.
 		"AUTH_MODE": "id.org.ai",
-		// Per-mailbox access (workers/lib/access.ts): owner + granted members;
-		// admins come from the MAILBOX_ADMINS SECRET (emails or subs), not a var.
-		// Without it, mailboxes that have no ACL yet (everything created before
-		// per-mailbox access) are readable only by their address holder.
+		// Per-mailbox access (workers/lib/access.ts): owner + granted members.
+		// Admins come from id.org.ai: owner/admin of this WorkOS org, asked over
+		// AUTH_SERVICE.orgRole and cached 60s. This is id.org.ai's platform org
+		// (its PLATFORM_ORG_ID). The MAILBOX_ADMINS SECRET is break-glass only:
+		// empty by default, set it only when id.org.ai can't answer.
+		"MAILBOX_ADMIN_ORG_ID": "org_01K05B2AERNQ8N0QVSRFBSCNMS",
 		"ID_ORG_AI_ISSUER": "https://id.org.ai",
 		// Bearer JWTs must carry one of these audiences (RFC 8707 resource
 		// indicators id.org.ai binds into `aud`). Session JWTs (no aud) and
@@ -67,6 +69,11 @@
 			"name": "EMAIL",
 			"remote": true
 		}
+	],
+	"services": [
+		// id.org.ai's AuthService RPC (same .do account): orgRole(sub, orgId)
+		// answers who administers every mailbox (workers/lib/access.ts).
+		{ "binding": "AUTH_SERVICE", "service": "oauth", "entrypoint": "AuthService" }
 	],
 	"r2_buckets": [
 		{

@@ -151,7 +151,7 @@ app.post("/api/v1/mailboxes", async (c) => {
 	//  - anyone else only for their OWN verified address, matched exactly
 	//    after normalization: no plus/dot aliases, no case or Unicode tricks.
 	const principal = c.get("principal");
-	const admin = isAdmin(c.env, principal);
+	const admin = await isAdmin(c.env, principal);
 	if (!admin) {
 		if (requestedOwner !== undefined) return c.json({ error: "Only admins can create a mailbox for someone else" }, 403);
 		if (!isOwnVerifiedAddress(principal, email)) {

@@ -41,12 +41,15 @@ export interface Env extends Cloudflare.Env {
 	RELAY_KEYS?: string; // secret
 
 	// --- Per-mailbox authorization (workers/lib/access.ts) ---
-	// Admin allowlist: emails and/or id.org.ai subs, comma/space separated or a
-	// JSON array. Admins can read every mailbox; everyone else only mailboxes
-	// they own or were granted. Unset = no admins (deny by default). Set with
-	// `wrangler secret put MAILBOX_ADMINS` (kept out of wrangler.jsonc vars so
-	// identities are not committed to the repo).
-	MAILBOX_ADMINS?: string; // secret
+	// Admins can read every mailbox; everyone else only mailboxes they own or
+	// were granted. Admin is an id.org.ai role: owner/admin of the WorkOS org
+	// MAILBOX_ADMIN_ORG_ID, asked over the AUTH_SERVICE binding (both arrive
+	// via the generated Cloudflare.Env; access.ts reads them tolerantly).
+	// MAILBOX_ADMINS is BREAK-GLASS ONLY: emails and/or id.org.ai subs, comma/
+	// space separated or a JSON array. Empty by default; set it with
+	// `wrangler secret put MAILBOX_ADMINS` only when id.org.ai can't answer,
+	// and delete it afterwards.
+	MAILBOX_ADMINS?: string; // secret, break-glass
 
 	// --- agents@ archive (workers/lib/archive.ts) ---
 	// ARCHIVE_ADDRESS ("agents@do.industries") and ARCHIVE_ENABLED (true) are

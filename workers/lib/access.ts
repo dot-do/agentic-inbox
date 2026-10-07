@@ -4,8 +4,7 @@
 // could read every mailbox). Deny by default: a principal may use a mailbox
 // only when ONE of these holds:
 //
-//   1. The principal is an admin: its email or sub is listed in the
-//      MAILBOX_ADMINS config (comma/space separated, or a JSON array).
+//   1. The principal is an admin (see "Who is an admin" below).
 //   2. The principal's verified email IS the mailbox address (the address
 //      holder owns their own mailbox).
 //   3. The mailbox ACL (R2 object `mailbox-acl/<mailboxId>.json`) names the
@@ -21,6 +20,21 @@
 // Identities come from the authenticated principal (workers/lib/auth.ts):
 // id.org.ai session cookie, id.org.ai bearer token, or a Cloudflare Access
 // JWT. Matching is case-insensitive on email and sub.
+//
+// Who is an admin. Admin is a role held in id.org.ai, not a list kept here:
+//
+//   a. id.org.ai (the source of truth): the principal's id.org.ai `sub` holds
+//      the `owner` or `admin` role in the WorkOS organization
+//      MAILBOX_ADMIN_ORG_ID (unset: id.org.ai's platform org), asked over the
+//      AUTH_SERVICE binding (`orgRole(sub, orgId)`). The answer is cached per
+//      isolate for ADMIN_ROLE_TTL_MS, so a granted or revoked role takes
+//      effect within a minute. Only in AUTH_MODE "id.org.ai" (an Access `sub`
+//      is not an id.org.ai identity). A failed lookup is not cached and
+//      grants nothing.
+//   b. Break-glass only: the MAILBOX_ADMINS secret (emails or subs, comma/space
+//      separated or a JSON array). Empty by default; set it only to regain
+//      access when id.org.ai is unreachable or misconfigured, and remove it
+//      afterwards (`wrangler secret delete MAILBOX_ADMINS`).
 
 import type { Env } from "../types";
 
@@ -102,11 +116,76 @@ export function parseAdminList(raw: unknown): Set<string> {
 	);
 }
 
-export function isAdmin(env: Env, p: Principal | undefined | null): boolean {
+/** Roles in the admin org that make a principal a mailbox admin. */
+export const ADMIN_ROLES: ReadonlySet<string> = new Set(["owner", "admin"]);
+
+/** How long an id.org.ai role answer is reused within an isolate. */
+export const ADMIN_ROLE_TTL_MS = 60_000;
+
+/** Cap on cached answers per isolate; the cache is cleared when exceeded. */
+const ADMIN_ROLE_CACHE_MAX = 1_000;
+
+/** The slice of id.org.ai's AuthService RPC this module uses. */
+export interface OrgRoleService {
+	orgRole(sub: string, orgId?: string): Promise<string | null>;
+}
+
+const adminRoleCache = new Map<string, { admin: boolean; expires: number }>();
+
+/** Test hook: forget cached id.org.ai answers. */
+export function clearAdminRoleCache(): void {
+	adminRoleCache.clear();
+}
+
+// Bindings and vars read through tolerant accessors: wrangler types renders
+// them into the generated Cloudflare.Env, so they are not redeclared on Env.
+function orgRoleService(env: Env): OrgRoleService | undefined {
+	const svc = (env as unknown as { AUTH_SERVICE?: Partial<OrgRoleService> }).AUTH_SERVICE;
+	return svc && typeof svc.orgRole === "function" ? (svc as OrgRoleService) : undefined;
+}
+
+function adminOrgId(env: Env): string | undefined {
+	const v = (env as unknown as { MAILBOX_ADMIN_ORG_ID?: unknown }).MAILBOX_ADMIN_ORG_ID;
+	return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
+/** Break-glass: MAILBOX_ADMINS lists this principal's email or sub. */
+export function isBreakGlassAdmin(env: Env, p: Principal | undefined | null): boolean {
 	if (!p) return false;
-	if (p.dev) return true;
 	const admins = parseAdminList(env.MAILBOX_ADMINS);
 	return principalIds(p).some((id) => admins.has(id));
+}
+
+/** id.org.ai: the principal's sub holds owner/admin in the admin org (cached). */
+export async function isIdOrgAiAdmin(env: Env, p: Principal | undefined | null): Promise<boolean> {
+	if (!p?.sub || env.AUTH_MODE !== "id.org.ai") return false;
+	const svc = orgRoleService(env);
+	if (!svc) return false;
+	const org = adminOrgId(env);
+	const key = `${org ?? ""}|${p.sub}`;
+	const now = Date.now();
+	const hit = adminRoleCache.get(key);
+	if (hit && hit.expires > now) return hit.admin;
+	let admin: boolean;
+	try {
+		const role = await svc.orgRole(p.sub, org);
+		admin = typeof role === "string" && ADMIN_ROLES.has(role);
+	} catch (err) {
+		// Not cached: the next request asks again. Grants nothing meanwhile.
+		console.warn("[access] id.org.ai orgRole lookup failed", err instanceof Error ? err.message : err);
+		return false;
+	}
+	if (adminRoleCache.size >= ADMIN_ROLE_CACHE_MAX) adminRoleCache.clear();
+	adminRoleCache.set(key, { admin, expires: now + ADMIN_ROLE_TTL_MS });
+	return admin;
+}
+
+/** Admin: an id.org.ai org owner/admin, or listed in the break-glass MAILBOX_ADMINS. */
+export async function isAdmin(env: Env, p: Principal | undefined | null): Promise<boolean> {
+	if (!p) return false;
+	if (p.dev) return true;
+	if (isBreakGlassAdmin(env, p)) return true;
+	return isIdOrgAiAdmin(env, p);
 }
 
 /** True when the principal's verified email is the mailbox address. */
@@ -160,7 +239,7 @@ export async function canAccessMailbox(
 	mailboxId: string,
 ): Promise<boolean> {
 	if (!p) return false;
-	if (isAdmin(env, p)) return true;
+	if (await isAdmin(env, p)) return true;
 	if (isAddressHolder(p, mailboxId)) return true;
 	const ids = principalIds(p);
 	if (ids.length === 0) return false;
@@ -177,7 +256,7 @@ export async function canManageMailbox(
 	mailboxId: string,
 ): Promise<boolean> {
 	if (!p) return false;
-	if (isAdmin(env, p)) return true;
+	if (await isAdmin(env, p)) return true;
 	if (isAddressHolder(p, mailboxId)) return true;
 	const ids = principalIds(p);
 	const acl = await getMailboxAcl(env.BUCKET, mailboxId);
@@ -195,7 +274,7 @@ export async function filterAccessibleMailboxes<T extends { id: string }>(
 	mailboxes: T[],
 ): Promise<T[]> {
 	if (!p) return [];
-	if (isAdmin(env, p)) return mailboxes;
+	if (await isAdmin(env, p)) return mailboxes;
 	const allowed = await Promise.all(mailboxes.map((m) => canAccessMailbox(env, p, m.id)));
 	return mailboxes.filter((_, i) => allowed[i]);
 }
