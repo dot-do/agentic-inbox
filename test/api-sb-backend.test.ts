@@ -3,7 +3,7 @@
 // React app renders. api.sb is an in-memory fake of its records surface.
 import { describe, expect, it } from "vitest";
 import { apiSbBackend, PRINCIPALS } from "../workers/routes/api-sb-backend";
-import { folderOf, rowOf } from "../workers/lib/api-sb";
+import { folderOf, namespaceOf, rowOf } from "../workers/lib/api-sb";
 
 type J = Record<string, any>;
 const BOX = { id: "mailbox_abc123abc123", address: "support@acme.example", name: "Support", settings: JSON.stringify({ fromName: "Acme Support" }), status: "open" };
@@ -21,6 +21,7 @@ function fakeApiSb() {
 		const method = init?.method ?? "GET";
 		const body = init?.body ? JSON.parse(String(init.body)) : undefined;
 		calls.push({ method, path: u.pathname + u.search, auth: new Headers(init?.headers).get("authorization"), body });
+		if (!u.pathname.startsWith("/acme.example/")) return Response.json({ error: { code: "not_address_owner" } }, { status: 403 });
 		const p = u.pathname.replace(/^\/acme\.example/, "");
 		if (p === "/mailboxes") return Response.json({ mailboxes: [BOX], links: {} });
 		if (p === "/mailboxes/support-at-acme.example") return Response.json({ record: BOX });
@@ -46,9 +47,10 @@ function fakeApiSb() {
 }
 
 const env = {
-	MAIL_BACKEND: "api.sb", API_SB_URL: "https://api.sb", API_SB_STARTUP: "acme.example", API_SB_TOKEN: "service-token",
+	MAIL_BACKEND: "api.sb", API_SB_URL: "https://api.sb", API_SB_TOKEN: "service-token",
 	MAILBOX_ADMINS: "admin@acme.example",
-	BUCKET: { async get() { return null; }, async head() { return null; } },
+	// emails.do's own list of the addresses it serves (mailboxes/<address>.json), kept
+	BUCKET: { async get() { return null; }, async head() { return null; }, async list() { return { objects: [{ key: "mailboxes/support@acme.example.json" }] }; } },
 };
 
 async function call(app: ReturnType<typeof apiSbBackend>, method: string, path: string, o: { body?: unknown; bearer?: string; who?: J } = {}) {
@@ -115,5 +117,24 @@ describe("emails.do reads and sends through api.sb", () => {
 		expect(folderOf({ direction: "outbound", status: "draft" })).toBe("draft");
 		expect(rowOf({ id: "m", direction: "inbound", from: "a@b.c", to: "d@e.f", references: "r1 r2", text: "t", receivedAt: "2026-01-01T00:00:00.000Z" }))
 			.toMatchObject({ id: "m", folder_id: "inbox", sender: "a@b.c", recipient: "d@e.f", email_references: '["r1","r2"]', body: "t", date: "2026-01-01T00:00:00.000Z" });
+	});
+
+	it("reads each Mailbox in the namespace of the Startup that owns its address, never emails.do's", async () => {
+		const { fetcher, calls } = fakeApiSb();
+		const app = apiSbBackend(fetcher);
+		await call(app, "GET", "/api/v1/mailboxes");
+		await call(app, "GET", "/api/v1/mailboxes/support@acme.example/emails?folder=inbox");
+		await call(app, "POST", "/api/v1/mailboxes/support@acme.example/emails", { bearer: "agent-token", body: { to: "pat@x.example", subject: "Hi", text: "Hello" } });
+		expect(calls.length).toBeGreaterThan(2);
+		expect(calls.every((c) => c.path.startsWith("/acme.example/"))).toBe(true);
+	});
+
+	it("names the owner from the address: the Studio's names, else the Domain; the map wins", () => {
+		expect(namespaceOf("team@startups.studio")).toBe("startups.studio");
+		expect(namespaceOf("ops@api.sb")).toBe("startups.studio");
+		expect(namespaceOf("Support@Mail.Acme.example")).toBe("acme.example");
+		expect(namespaceOf("ledger@emails.do")).toBe("emails.do");
+		expect(namespaceOf("hi@acme.co.uk", { API_SB_NAMESPACES: JSON.stringify({ "acme.co.uk": "acme.co.uk" }) })).toBe("acme.co.uk");
+		expect(namespaceOf("hi@door.example", { API_SB_NAMESPACES: JSON.stringify({ "hi@door.example": "acme.example" }) })).toBe("acme.example");
 	});
 });

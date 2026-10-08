@@ -64,7 +64,11 @@
 		"RETIRING": "api.sb (StartupsStudio/sb#337): kept read-only, never deleted",
 		"MAIL_BACKEND": "",
 		"API_SB_URL": "https://api.sb",
-		"API_SB_STARTUP": ""
+		// Each Mailbox is in the namespace of the Startup that owns its address
+		// (lib/api-sb.ts namespaceOf), never emails.do's. A JSON map
+		// {"<address or host>": "<namespace>"} names the owner where the
+		// address's name does not say it.
+		"API_SB_NAMESPACES": ""
 	},
 	"send_email": [
 		{

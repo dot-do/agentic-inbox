@@ -12,8 +12,11 @@
 > - **Export, read-only:** `POST /api/v1/_admin/export` (HMAC, `RELAY_SECRET`) answers every mailbox and every row,
 >   soft-deleted ones too, for sb's importer (`poc/workers/api-sb-prototype/scripts/import-emails-do.ts`), which checks
 >   counts after.
-> - **Client of api.sb:** with `MAIL_BACKEND = "api.sb"` (plus `API_SB_STARTUP`, and the `API_SB_TOKEN` secret) the
->   UI's mailbox routes read and send through api.sb (`workers/routes/api-sb-backend.ts`). Unset, nothing changes.
+> - **Client of api.sb:** with `MAIL_BACKEND = "api.sb"` (and the `API_SB_TOKEN` secret) the UI's mailbox routes read
+>   and send through api.sb (`workers/routes/api-sb-backend.ts`). Unset, nothing changes. Each Mailbox is in the
+>   namespace of the Startup that owns its address (`@startups.studio` ones in startups.studio, each Startup's in its
+>   own), never in one of emails.do's: emails.do is the provider. `API_SB_NAMESPACES` maps a host to its owner where
+>   the name does not say it.
 > - **Order:** deploy this branch, import, check the counts, switch Email Routing to api.sb, set `MAIL_BACKEND`.
 >   New features go to api.sb, not here.
 
